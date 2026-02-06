@@ -391,7 +391,7 @@ def load_pretrained_weights(
     model: nn.Module, checkpoint_path: str, skip_io_check: bool = False,
 ):
     """
-    Load pretrained weights into (s)DANNCE model.
+    Load pretrained weights into (s)DANNCE model with DataParallel compatibility.
     """
     assert checkpoint_path is not None and os.path.exists(
         checkpoint_path
@@ -400,24 +400,77 @@ def load_pretrained_weights(
     state_dict = torch.load(checkpoint_path)["state_dict"]
 
     if skip_io_check:
+        # Try direct loading first
+        try:
+            model.load_state_dict(state_dict, strict=False)
+            return model
+        except:
+            pass
+            
+        # If direct loading fails, try with module prefix handling
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(state_dict.keys())
+        
+        # Check if we need to add module. prefix
+        if any(key.startswith('module.') for key in model_keys) and not any(key.startswith('module.') for key in checkpoint_keys):
+            state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+        # Check if we need to remove module. prefix    
+        elif not any(key.startswith('module.') for key in model_keys) and any(key.startswith('module.') for key in checkpoint_keys):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
         model.load_state_dict(state_dict, strict=False)
         return model
 
-    # check whether input & output dimensions mismatch
+    # Original validation logic with prefix handling
+    try:
+        checkpoint_info = checkpoint_weights_type(state_dict)
+    except ValueError:
+        # Try with module prefix stripped
+        stripped_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}
+        if stripped_state_dict:
+            try:
+                checkpoint_info = checkpoint_weights_type(stripped_state_dict)
+                state_dict = stripped_state_dict
+            except ValueError:
+                pass
+        
+        # Try with module prefix added
+        if 'checkpoint_info' not in locals():
+            prefixed_state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+            try:
+                checkpoint_info = checkpoint_weights_type(prefixed_state_dict)
+                state_dict = prefixed_state_dict
+            except ValueError:
+                raise ValueError("Invalid checkpoint format after trying prefix adjustments.")
+
+    # Extract checkpoint information
     (
         is_sdannce_weights,
         checkpoint_input_size,
         checkpoint_output_size,
         input_weight_name,
         output_weight_name,
-    ) = checkpoint_weights_type(state_dict)
+    ) = checkpoint_info
+    
+    # Handle model state_dict with same prefix logic
+    try:
+        model_info = checkpoint_weights_type(model.state_dict())
+    except ValueError:
+        # Similar prefix handling for model state_dict
+        model_state_dict = model.state_dict()
+        if any(k.startswith('module.') for k in model_state_dict.keys()):
+            stripped_model_dict = {k.replace('module.', ''): v for k, v in model_state_dict.items()}
+            model_info = checkpoint_weights_type(stripped_model_dict)
+        else:
+            raise ValueError("Invalid model format.")
+    
     (
         is_sdannce_model,
         model_input_size,
         model_output_size,
         _,
         _,
-    ) = checkpoint_weights_type(model.state_dict())
+    ) = model_info
 
     # pop mismatch weights from checkpoint
     if checkpoint_input_size != model_input_size:
@@ -433,6 +486,17 @@ def load_pretrained_weights(
         )
         state_dict.pop(output_weight_name, None)
         state_dict.pop(output_weight_name.replace("weight", "bias"), None)
+
+    # Final prefix alignment before loading
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(state_dict.keys())
+    
+    # Check if we need to add module. prefix for final loading
+    if any(key.startswith('module.') for key in model_keys) and not any(key.startswith('module.') for key in checkpoint_keys):
+        state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+    # Check if we need to remove module. prefix for final loading   
+    elif not any(key.startswith('module.') for key in model_keys) and any(key.startswith('module.') for key in checkpoint_keys):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
     # load weights
     if is_sdannce_weights == is_sdannce_model:
@@ -500,7 +564,7 @@ def initialize_train(
             torch.optim.lr_scheduler, params["lr_scheduler"]["type"]
         )
         lr_scheduler = lr_scheduler_class(
-            optimizer=optimizer, **params["lr_scheduler"]["args"], verbose=True
+            optimizer=optimizer, **params["lr_scheduler"]["args"]
         )
         logger.info(
             "Using learning rate scheduler: {}".format(params["lr_scheduler"]["type"])
@@ -580,7 +644,7 @@ def initialize_com_train(
             torch.optim.lr_scheduler, params["lr_scheduler"]["type"]
         )
         lr_scheduler = lr_scheduler_class(
-            optimizer=optimizer, **params["lr_scheduler"]["args"], verbose=True
+            optimizer=optimizer, **params["lr_scheduler"]["args"]
         )
         logger.info(
             "Using learning rate scheduler: {}".format(params["lr_scheduler"]["type"])

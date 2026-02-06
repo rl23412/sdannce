@@ -1,0 +1,100 @@
+### DANNCE Configuration with 2D Training and Confidence Weighting ###
+
+### basic ###
+io_config: io.yaml
+camnames: ['Camera1', 'Camera2', 'Camera3', 'Camera4', 'Camera5', 'Camera6']
+n_instances: 1  # Single animal
+random_seed: 1024
+
+### data ###
+crop_height: [0, 1200]
+crop_width: [0, 1920]
+
+# volumetric representation
+vmin: -120
+vmax: 120
+nvox: 80
+interp: nearest
+
+unlabeled_sampling: equal
+COM_augmentation: True
+
+### train ###
+batch_size: 8
+epochs: 50
+lr: 0.0001
+train_mode: new
+
+num_validation_per_exp: 4
+save_period: 10
+data_split_seed: 1024
+
+lr_scheduler:
+  type: MultiStepLR
+  args: 
+    milestones: [25, 40]
+    gamma: 0.5
+
+### architecture ###
+expval: True
+net_type: "compressed_dannce"
+n_channels_in: 3
+n_channels_out: 20
+new_n_channels_out: 20
+n_views: 6
+
+### 2D Training Configuration ###
+# Enable 2D reprojection training alongside 3D training
+train_on_2d: True
+
+# Main loss configuration - applies to 3D training
+loss:
+    L1Loss: 
+      loss_weight: 1.0
+
+# Dedicated 2D loss configuration
+loss_2d:
+    L1Loss:
+      loss_weight: 1.0
+
+### 2D Confidence Weighting Configuration ###
+# Enable confidence-based loss weighting for 2D training
+use_2d_confidence_weighting: True
+
+# Minimum confidence threshold - keypoints below this get very low weight  
+min_confidence_threshold: 0.4
+
+# Confidence weighting method: 'linear', 'sigmoid', 'exponential'
+# - linear: weight = confidence * strength
+# - sigmoid: weight = sigmoid((confidence - 0.5) * 6 * strength) 
+# - exponential: weight = confidence^(1/strength)
+confidence_loss_weighting_method: 'linear'
+
+# Confidence weighting strength (scaling factor)
+confidence_weighting_strength: 1.0
+
+### 2D Loss Stability Parameters ###
+clip_2d_loss: True
+max_2d_loss_value: 70.0
+clip_projections: True
+max_projection_coord: 5000.0
+check_3d_bounds: True
+check_projection_bounds: True
+
+### metrics ###
+metric: ['euclidean_distance_3D']
+
+### data augmentation ###      
+medfilt_window: 13
+rand_view_replace: True
+n_rand_views: 6
+mirror_augmentation: True
+left_keypoints: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+right_keypoints: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+
+augment_hue: True
+augment_brightness: True
+augment_bright_val: 0.05
+
+### predictions ###
+max_num_samples: max

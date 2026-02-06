@@ -50,8 +50,17 @@ dannce_finetune_weights: ./DANNCE/weights/dannce-c-r7m.pth # needed for 'finetun
 loss: 
   L1Loss:
     loss_weight: 1.0
+  HuberLoss:
+    loss_weight: 0.5
+    delta: 1.0  # Huber loss threshold parameter
+  # Alternative: Use CharbonnierLoss instead of HuberLoss for 2D reprojection
+  # CharbonnierLoss:
+  #   loss_weight: 0.5
+  #   epsilon: 1e-3  # Charbonnier smoothing parameter
 
 metric: ['euclidean_distance_3D']
+
+train_on_2d: True
 
 lr: 0.0001
 # one may find the available learning schedulers in 

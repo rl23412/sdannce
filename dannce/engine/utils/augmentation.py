@@ -33,7 +33,11 @@ def random_rotate(X, y_3d, aux=None):
 
 
 def apply_random_transforms(volumes, grids, aux=None):
-    grids = grids.reshape(grids.shape[0], 80, 80, 80, 3)
+    # Dynamically compute grid dimensions from grids shape [batch_size, nvox**3, 3]
+    batch_size = grids.shape[0]
+    nvox_cubed = grids.shape[1]
+    nvox = int(round(nvox_cubed ** (1/3)))
+    grids = grids.reshape(batch_size, nvox, nvox, nvox, 3)
 
     volumes, grids, aux = random_rotate(volumes, grids, aux)
     grids = grids.reshape(grids.shape[0], -1, 3)

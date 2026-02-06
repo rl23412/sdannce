@@ -196,9 +196,16 @@ def infer_com(
 def infer_dannce_inference_range(
     params: Dict, generator: torch.utils.data.Dataset,
 ):
-    n_frames = len(generator)
+    # Get the number of frames from list_IDs if available
+    if hasattr(generator, "list_IDs"):
+        n_frames = len(generator.list_IDs)
+    else:
+        # Fallback to generator length, but this should represent number of batches
+        # for properly implemented generators
+        n_frames = len(generator) * params["batch_size"]
+    
     bs = params["batch_size"]
-    generator_maxbatch = np.ceil(n_frames / bs)
+    generator_maxbatch = np.ceil(n_frames/bs)
 
     if params["maxbatch"] != "max" and params["maxbatch"] > generator_maxbatch:
         print(
@@ -380,7 +387,9 @@ def infer_sdannce(
         params["max_num_samples"] if params["max_num_samples"] != "max" else n_frames
     )
 
-    pbar = tqdm(range(start_ind, end_ind))
+    # s-DANNCE inference processes individual samples, so we iterate over sample indices
+    # not batch indices like regular DANNCE does
+    pbar = tqdm(range(0, min(max_num_sample, n_frames), bs))
     for idx, i in enumerate(pbar):
 
         if (i - start_ind) % 1000 == 0 and i != start_ind:

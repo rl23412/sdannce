@@ -19,14 +19,23 @@ from dannce.engine.utils.vis import draw_voxels
 
 def compute_mask_nan_loss(loss_fcn, kpts_gt, kpts_pred):
     # kpts_gt, kpts_pred, notnan = mask_nan(kpts_gt, kpts_pred)
+    # Ensure finite values only, replace inf with nan so they are masked
+    kpts_gt = torch.where(torch.isfinite(kpts_gt), kpts_gt, torch.tensor(float('nan'), device=kpts_gt.device, dtype=kpts_gt.dtype))
+    kpts_pred = torch.where(torch.isfinite(kpts_pred), kpts_pred, torch.tensor(0.0, device=kpts_pred.device, dtype=kpts_pred.dtype))
     notnan_gt = ~torch.isnan(kpts_gt)
-    notnan = notnan_gt.sum()
+    notnan_count = notnan_gt.sum()
     # when ground truth is all NaN for certain reasons, do not compute loss since it results in NaN
-    if notnan == 0:
+    if notnan_count == 0:
         # print("Found all NaN ground truth")
         return kpts_pred.new_zeros((), requires_grad=True)
 
-    return loss_fcn(kpts_gt[notnan_gt], kpts_pred[notnan_gt]) / notnan
+    # Use mean reduction instead of sum/count to avoid gradient scaling issues
+    valid_gt = kpts_gt[notnan_gt]
+    valid_pred = kpts_pred[notnan_gt]
+    
+    # Compute loss using mean reduction for better gradient flow
+    loss = torch.nn.functional.l1_loss(valid_pred, valid_gt, reduction='mean')
+    return loss
 
 
 ##################################################################################################
@@ -80,11 +89,35 @@ class BCELoss(BaseLoss):
 
 
 class HuberLoss(BaseLoss):
-    def __init__(self, **kwargs):
+    def __init__(self, delta=1.0, **kwargs):
         super().__init__(**kwargs)
+        self.delta = float(delta)  # Ensure delta is a float
 
     def forward(self, kpts_gt, kpts_pred):
-        return F.huber_loss(kpts_gt, kpts_pred)
+        loss = compute_mask_nan_loss(
+            lambda gt, pred: F.huber_loss(gt, pred, delta=self.delta, reduction="sum"), 
+            kpts_gt, 
+            kpts_pred
+        )
+        return self.loss_weight * loss
+
+
+class CharbonnierLoss(BaseLoss):
+    def __init__(self, epsilon=1e-3, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = float(epsilon)  # Ensure epsilon is a float
+
+    def forward(self, kpts_gt, kpts_pred):
+        """
+        Charbonnier loss: sqrt(x^2 + epsilon^2)
+        More robust to outliers than L2, smoother than L1
+        """
+        loss = compute_mask_nan_loss(
+            lambda gt, pred: torch.sum(torch.sqrt((gt - pred) ** 2 + self.epsilon ** 2)),
+            kpts_gt,
+            kpts_pred
+        )
+        return self.loss_weight * loss
 
 
 class BCEWithLogitsLoss(BaseLoss):
@@ -476,14 +509,14 @@ class GaussianRegLoss(BaseLoss):
         )  # [bs, n_joints, n_vox, n_vox, n_vox]
         for i in range(y_3d.shape[0]):
             for j in range(y_3d.shape[1]):
-                y_3d[i, j] = torch.exp(
+                exp_term = torch.exp(
                     -(
                         (grids[i, 1] - centers[i, 1, j]) ** 2
                         + (grids[i, 0] - centers[i, 0, j]) ** 2
                         + (grids[i, 2] - centers[i, 2, j]) ** 2
-                    )
+                    ) / (2 * self.sigma ** 2)
                 )
-                y_3d[i, j] /= 2 * self.sigma ** 2
+                y_3d[i, j] = exp_term
 
         return y_3d
 
@@ -649,7 +682,7 @@ class VarianceLoss(BaseLoss):
         )  # [bs, n_joints, 1, 1, 1, 3]
 
         diff = torch.sum((grids - kpts_pred).sqrt(), dim=-1)  # [bs, n_joints, h, w, d]
-        diff *= prob
+        diff = diff * prob
 
         loss = self.loss_weight * torch.mean(torch.sum(diff, dim=[2, 3, 4]))
 

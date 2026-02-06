@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 from loguru import logger
 from tqdm import tqdm
+import pickle
 
 from dannce.config import _DEFAULT_SEG_MODEL
 from dannce.engine.data import (dataset, generator, processing,
@@ -95,6 +96,7 @@ def make_dataset(
     # make train/valid splits
     partition = processing.make_data_splits(
         samples,
+        datadict,  # Pass the datadict for debugging
         params,
         params["dannce_train_dir"],
         num_experiments,
@@ -104,8 +106,17 @@ def make_dataset(
     if params["is_social_dataset"]:
         partition, pairs = processing.resplit_social(partition)
 
+    # Load the partition file that was just saved
+    partition_path = os.path.join(params["dannce_train_dir"], "partition.pkl")
+    if os.path.exists(partition_path):
+        with open(partition_path, "rb") as f:
+            partition = pickle.load(f)
+        logger.info(f"💾 Loaded data partition from {partition_path}")
+    else:
+        logger.warning(f"Could not find partition file at {partition_path}")
+
     # Check if there are any unlabeled samples
-    samples = partition["train_sampleIDs"]
+    samples = partition.get("train_sampleIDs", [])
     unlabeled_samples = []
     for samp in samples:
         if np.isnan(datadict_3d[samp]).all():
@@ -565,6 +576,17 @@ def _make_data_npy(
         npydir, missing_npydir, missing_samples = rat7m_npy
         missing_samples = np.array(sorted(missing_samples))
     else:
+        # Optionally limit npy caching to just train/valid samples
+        if not params.get("cache_all_npy", True):
+            try:
+                required = np.concatenate(
+                    (partition["train_sampleIDs"], partition["valid_sampleIDs"])
+                )
+                samples = np.unique(required)
+            except Exception:
+                # Fall back to all samples if partition is missing
+                pass
+
         # Populate with COM augmented samples if needed
         if params["COM_augmentation"]:
             (
@@ -673,7 +695,9 @@ def _make_data_npy(
     args_train = {
         "list_IDs": partition["train_sampleIDs"],
         "labels_3d": datadict_3d,
+        "labels_2d": datadict,
         "npydir": npydir,
+        "cameras": cameras,
     }
     args_train = {
         **args_train,
@@ -686,12 +710,15 @@ def _make_data_npy(
         "temporal_chunk_list": partition["train_chunks"]
         if params["use_temporal"]
         else None,
+        "partition": partition,
     }
 
     args_valid = {
         "list_IDs": partition["valid_sampleIDs"],
         "labels_3d": datadict_3d,
+        "labels_2d": datadict,
         "npydir": npydir,
+        "cameras": cameras,
         "aux_labels": None,
         "aux": params["use_silhouette"],
     }
@@ -704,11 +731,64 @@ def _make_data_npy(
         "temporal_chunk_list": partition["valid_chunks"]
         if params["use_temporal"]
         else None,
+        "partition": partition,
     }
 
     # if params["is_social_dataset"]:
     #     args_train = {**args_train, "pairs": pairs["train_pairs"]}
     #     args_valid = {**args_valid, "pairs": pairs["valid_pairs"]}
+
+    # Proactively ensure cache exists for all partition samples (train and valid)
+    def _ensure_npy_for_ids(ids, silhouette=False):
+        if ids is None:
+            return
+        ids = list(ids)
+        missing_ids = []
+        target_dirs = {}
+        for samp in ids:
+            try:
+                e, sampleID = int(samp.split("_")[0]), samp.split("_")[1]
+            except Exception:
+                continue
+            im_path = os.path.join(npydir[e], "image_volumes", f"0_{sampleID}.npy")
+            grid_path = os.path.join(npydir[e], "grid_volumes", f"0_{sampleID}.npy")
+            if not (os.path.exists(im_path) and os.path.exists(grid_path)):
+                missing_ids.append(samp)
+                target_dirs[e] = npydir[e]
+        if len(missing_ids) == 0:
+            return
+        logger.info(f"Regenerating {len(missing_ids)} missing NPY samples for cache (silhouette={silhouette})")
+        # Use 3Dconv generators to rebuild cache from source
+        genfunc_cache = generator.DataGenerator_3Dconv
+        spec_params = {"channel_combo": None, "predict_flag": False, "norm_im": False, "expval": True}
+        if params["is_social_dataset"]:
+            spec_params["occlusion"] = params["downscale_occluded_view"]
+            genfunc_cache = generator.DataGenerator_3Dconv_social
+        valid_params_local = {**base_params, **spec_params}
+        npy_generator = genfunc_cache(
+            missing_ids,
+            datadict,
+            datadict_3d,
+            cameras,
+            missing_ids,
+            com3d_dict,
+            tifdirs,
+            **valid_params_local,
+        )
+        processing.save_volumes_into_npy(
+            params,
+            npy_generator,
+            {e: npydir[e] for e in target_dirs.keys()},
+            samples,
+            silhouette=silhouette,
+        )
+        try:
+            npy_generator.close_all_readers()
+        except Exception:
+            pass
+
+    _ensure_npy_for_ids(partition.get("train_sampleIDs"))
+    _ensure_npy_for_ids(partition.get("valid_sampleIDs"))
 
     # initialize datasets and dataloaders
     train_generator = genfunc(**args_train)
@@ -870,6 +950,8 @@ def _make_data_mem(
         "list_IDs": np.arange(len(partition["train_sampleIDs"])),
         "data": X_train,
         "labels": y_train,
+        "labels_2d": datadict,
+        "cameras": cameras,
     }
     args_train = {
         **args_train,
@@ -880,12 +962,15 @@ def _make_data_mem(
         "temporal_chunk_list": partition["train_chunks"]
         if params["use_temporal"]
         else None,
+        "partition": partition,
     }
 
     args_valid = {
         "list_IDs": np.arange(len(partition["valid_sampleIDs"])),
         "data": X_valid,
         "labels": y_valid,
+        "labels_2d": datadict,
+        "cameras": cameras,
         "aux_labels": y_valid_aux,
     }
     args_valid = {
@@ -896,6 +981,7 @@ def _make_data_mem(
         "temporal_chunk_list": partition["valid_chunks"]
         if params["use_temporal"]
         else None,
+        "partition": partition,
     }
 
     if params["is_social_dataset"]:
@@ -994,7 +1080,7 @@ def make_dataset_inference(params, valid_params):
     if params["immode"] == "vid":
         vids = {}
         for e in range(num_experiments):
-            vids = processing.initialize_vids(params, datadict, 0, vids, pathonly=True)
+            vids = processing.initialize_vids(params, datadict, e, vids, pathonly=True)
 
     # Parameters
     valid_params = {
@@ -1210,14 +1296,14 @@ def make_data_com(params, train_params, valid_params):
         batch_size=params["batch_size"],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=1,
+        num_workers=0,
     )
     valid_dataloader = torch.utils.data.DataLoader(
         valid_generator,
         batch_size=1,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=1,
+        num_workers=0,
     )
 
     return train_dataloader, valid_dataloader

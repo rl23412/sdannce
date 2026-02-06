@@ -107,6 +107,76 @@ def load_com(path: Text) -> Dict:
     return data
 
 
+def load_label2d_confidence(path: Text) -> Union[List[Dict], None]:
+    """Load 2D confidence scores from Label3D file.
+    
+    Label3D files may contain confidence scores for 2D keypoint annotations.
+    These scores indicate the reliability of each keypoint annotation.
+    
+    Args:
+        path (Text): Path to Label3D file
+        
+    Returns:
+        Union[List[Dict], None]: List of confidence data dictionaries per experiment,
+                                or None if no confidence data available
+    """
+    try:
+        # Try to load confidence data from Label3D file
+        confidence_data = load_label3d_data(path, "confidence")
+        
+        # Process confidence data structure similar to labelData
+        processed_confidence = []
+        for conf_exp in confidence_data:
+            conf_dict = {}
+            # Extract confidence matrices per camera and keypoint
+            for key in conf_exp.dtype.names if hasattr(conf_exp, 'dtype') else conf_exp.keys():
+                if key in conf_exp:
+                    conf_dict[key] = conf_exp[key]
+            processed_confidence.append(conf_dict)
+            
+        return processed_confidence
+        
+    except (KeyError, TypeError):
+        # No confidence data available - this is normal for many datasets
+        return None
+    except Exception as e:
+        print(f"Warning: Could not load confidence data from {path}: {e}")
+        return None
+
+
+def create_default_confidence(labelData: List[Dict], default_confidence: float = 1.0) -> List[Dict]:
+    """Create default confidence scores when not available in Label3D file.
+    
+    Args:
+        labelData: List of labelData dictionaries from Label3D
+        default_confidence: Default confidence value to assign (1.0 = full confidence)
+        
+    Returns:
+        List[Dict]: List of confidence dictionaries matching labelData structure
+    """
+    confidence_data = []
+    
+    for exp_data in labelData:
+        conf_dict = {}
+        
+        # Create confidence scores matching the labelData structure
+        if 'data_2d' in exp_data and exp_data['data_2d'] is not None:
+            data_2d = exp_data['data_2d']
+            if isinstance(data_2d, np.ndarray) and len(data_2d.shape) >= 3:
+                # data_2d shape: (n_frames, n_cameras, n_keypoints, 2)
+                # Create confidence: (n_frames, n_cameras, n_keypoints)
+                n_frames, n_cameras, n_keypoints = data_2d.shape[:3]
+                conf_dict['data_2d_confidence'] = np.full(
+                    (n_frames, n_cameras, n_keypoints), 
+                    default_confidence, 
+                    dtype=np.float32
+                )
+        
+        confidence_data.append(conf_dict)
+    
+    return confidence_data
+
+
 def load_camnames(path: Text) -> Union[List, None]:
     """Load camera names from .mat file.
 

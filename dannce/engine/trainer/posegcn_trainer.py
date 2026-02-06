@@ -30,7 +30,14 @@ class SDANNCETrainer(DANNCETrainer):
             self.loss.loss_fcns.pop("L1Loss")
 
     def _forward(self, epoch, batch, train=True):
-        volumes, grid_centers, keypoints_3d_gt, aux = prepare_batch(batch, self.device)
+        volumes, grid_centers, keypoints_3d_gt, aux, keypoints_2d_gt, batch_debug_info, sample_ids = prepare_batch(batch, self.device)
+        
+        # Extract confidence data if available
+        confidence_2d_gt = None
+        if hasattr(batch, 'confidence_2d') and batch.confidence_2d is not None:
+            confidence_2d_gt = batch.confidence_2d
+        elif isinstance(batch, dict) and 'confidence_2d' in batch:
+            confidence_2d_gt = batch['confidence_2d']
 
         # debugging features
         if self.visualize_batch:
@@ -54,6 +61,16 @@ class SDANNCETrainer(DANNCETrainer):
                 .transpose(1, 0)
                 .flatten(0, 1)
             )
+            
+            # Handle 2D augmentation for social DANNCE
+            if keypoints_2d_gt is not None:
+                keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
+            if confidence_2d_gt is not None:
+                # Assuming confidence_2d_gt follows similar structure to keypoints_2d_gt
+                if isinstance(confidence_2d_gt, dict):
+                    confidence_2d_gt = {k: v.repeat(self.aug_bs, 1) for k, v in confidence_2d_gt.items()}
+                else:
+                    confidence_2d_gt = confidence_2d_gt.repeat(self.aug_bs, 1, 1)
 
         # initial pose generation
         init_poses, keypoints_3d_pred, heatmaps = self.model(volumes, grid_centers)
@@ -70,6 +87,10 @@ class SDANNCETrainer(DANNCETrainer):
             heatmaps,
             grid_centers,
             aux,
+            keypoints_2d_gt,
+            self.train_dataloader.dataset.cameras if hasattr(self.train_dataloader.dataset, 'cameras') else None,
+            sample_ids,
+            confidence_2d_gt,
         )
 
     def _forward_loss(
@@ -80,6 +101,10 @@ class SDANNCETrainer(DANNCETrainer):
         heatmaps,
         grid_centers,
         aux,
+        keypoints_2d_gt=None,
+        cameras=None,
+        sample_ids=None,
+        confidence_2d_gt=None,
     ):
         if self.predict_diff and (not self.relpose):
             # estimate absolute offsets
@@ -91,6 +116,10 @@ class SDANNCETrainer(DANNCETrainer):
                 heatmaps,
                 grid_centers,
                 aux,
+                keypoints_2d_gt=keypoints_2d_gt,
+                cameras=cameras,
+                sample_ids=sample_ids,
+                confidence_2d_gt=confidence_2d_gt,
             )
             total_loss += loss_sup
             loss_dict["L1DiffLoss"] = loss_sup.clone().detach().cpu().item()
@@ -107,7 +136,11 @@ class SDANNCETrainer(DANNCETrainer):
 
                 keypoints_3d_pred = keypoints_3d_pred * vsize + com3d
                 total_loss, loss_dict = self.loss.compute_loss(
-                    keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux
+                    keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux,
+                    keypoints_2d_gt=keypoints_2d_gt,
+                    cameras=cameras,
+                    sample_ids=sample_ids,
+                    confidence_2d_gt=confidence_2d_gt,
                 )
                 total_loss += loss_sup
                 loss_dict["L1Loss"] = loss_sup.clone().detach().cpu().item()
@@ -128,6 +161,10 @@ class SDANNCETrainer(DANNCETrainer):
                     heatmaps,
                     grid_centers,
                     aux,
+                    keypoints_2d_gt=keypoints_2d_gt,
+                    cameras=cameras,
+                    sample_ids=sample_ids,
+                    confidence_2d_gt=confidence_2d_gt,
                 )
                 total_loss += diff_loss
                 loss_dict["L1DiffLoss"] = diff_loss.clone().detach().cpu().item()
@@ -135,7 +172,11 @@ class SDANNCETrainer(DANNCETrainer):
         else:
             # direct estimation
             total_loss, loss_dict = self.loss.compute_loss(
-                keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux
+                keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux,
+                keypoints_2d_gt=keypoints_2d_gt,
+                cameras=cameras,
+                sample_ids=sample_ids,
+                confidence_2d_gt=confidence_2d_gt,
             )
 
         return total_loss, loss_dict, init_poses, keypoints_3d_gt, keypoints_3d_pred
@@ -170,6 +211,10 @@ class SDANNCETrainer(DANNCETrainer):
                 heatmaps,
                 grid_centers,
                 aux,
+                keypoints_2d_gt,
+                cameras,
+                sample_ids,
+                confidence_2d_gt,
             ) = self._forward(epoch, batch)
 
             (
@@ -185,6 +230,10 @@ class SDANNCETrainer(DANNCETrainer):
                 heatmaps,
                 grid_centers,
                 aux,
+                keypoints_2d_gt,
+                cameras,
+                sample_ids,
+                confidence_2d_gt,
             )
 
             result = f"Epoch[{epoch}/{self.epochs}] " + "".join(
@@ -233,6 +282,10 @@ class SDANNCETrainer(DANNCETrainer):
                     heatmaps,
                     grid_centers,
                     aux,
+                    keypoints_2d_gt,
+                    cameras,
+                    sample_ids,
+                    confidence_2d_gt,
                 ) = self._forward(epoch, batch, False)
 
                 (
@@ -248,6 +301,10 @@ class SDANNCETrainer(DANNCETrainer):
                     heatmaps,
                     grid_centers,
                     aux,
+                    keypoints_2d_gt,
+                    cameras,
+                    sample_ids,
+                    confidence_2d_gt,
                 )
 
                 epoch_loss_dict = self._update_step(epoch_loss_dict, loss_dict)

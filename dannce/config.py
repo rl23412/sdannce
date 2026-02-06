@@ -376,7 +376,24 @@ def check_unrecognized_params(params: dict):
     """
     # Check if key in any of the defaults
     invalid_keys = []
+    # Allowlisted extension keys that are not part of the historical defaults
+    # but are intentionally supported by the codebase (e.g., separate 3D/2D loss configs)
+    allowed_extra_keys = set([
+        "loss_3d",
+        "loss_2d",
+        "return_full2d",
+        "apply_2d_distortion",
+        "clip_2d_loss",
+        "max_2d_loss_value",
+        "clip_projections",
+        "max_projection_coord",
+        "check_3d_bounds",
+        "check_projection_bounds",
+        "gradient_clip_norm",
+    ])
     for key in params:
+        if key in allowed_extra_keys:
+            continue
         in_com = key in _param_defaults_com
         in_dannce = key in _param_defaults_dannce
         in_shared = key in _param_defaults_shared
@@ -610,15 +627,67 @@ def setup_predict(params: dict):
         params["n_instances"] = 1
     params["is_social_dataset"] = params["n_instances"] > 1
 
-    # While we can use experiment files for DANNCE training,
-    # for prediction we use the base data files present in the main config
-    # Grab the input file for prediction
+    # Prediction historically assumes a single recording with a *dannce.mat present in
+    # the current working directory. For projects that specify multiple recordings
+    # via an io.yaml `exp` list (each with its own label3d/com/video paths), fall back
+    # to building per-recording experiment dicts when no local label file is found.
+    exp_list = params.get("exp")
+    use_exp_list = False
     if params["dataset"] != "rat7m":
-        params["label3d_file"] = grab_predict_label3d_file(
-            index=params["label3d_index"]
-        )
-        params["base_exp_folder"] = os.path.dirname(params["label3d_file"])
+        try:
+            params["label3d_file"] = grab_predict_label3d_file(
+                index=params["label3d_index"]
+            )
+            params["base_exp_folder"] = os.path.dirname(params["label3d_file"])
+        except Exception:
+            if (
+                isinstance(exp_list, list)
+                and len(exp_list) > 0
+                and not params.get("is_social_dataset", False)
+            ):
+                use_exp_list = True
+            else:
+                raise
+
     params["multi_mode"] = False
+
+    # Build experiment dicts for prediction.
+    # NOTE: We intentionally keep experiment 0 as a reference to `params` so that
+    # prepend_experiment() can mutate params["chunks"] in-place for inference.
+    params["experiment"] = {}
+    if use_exp_list:
+        template = deepcopy(params)
+        for e, expdict in enumerate(exp_list):
+            exp_params = params if e == 0 else deepcopy(template)
+            exp_params["label3d_file"] = expdict["label3d_file"]
+            exp_params["base_exp_folder"] = os.path.dirname(exp_params["label3d_file"])
+            if "viddir" in expdict and expdict["viddir"] is not None:
+                exp_params["viddir"] = expdict["viddir"]
+            else:
+                exp_params["viddir"] = os.path.join(
+                    exp_params["base_exp_folder"], _DEFAULT_VIDDIR
+                )
+            if "com_file" in expdict:
+                exp_params["com_file"] = expdict["com_file"]
+
+            # Optional per-exp camnames override; otherwise keep global camnames (or infer).
+            l3d_camnames = io.load_camnames(exp_params["label3d_file"])
+            if "camnames" in expdict and expdict["camnames"] is not None:
+                exp_params["camnames"] = expdict["camnames"]
+            elif exp_params.get("camnames") is None and l3d_camnames is not None:
+                exp_params["camnames"] = l3d_camnames
+
+            # Ensure chunks exist per experiment (keys are un-prefixed camnames).
+            if isinstance(params.get("chunks"), dict):
+                exp_params["chunks"] = deepcopy(params["chunks"])
+
+            params["experiment"][e] = exp_params
+
+        # Keep top-level convenience fields aligned with experiment 0
+        params["label3d_file"] = params["experiment"][0]["label3d_file"]
+        params["base_exp_folder"] = params["experiment"][0]["base_exp_folder"]
+    else:
+        params["experiment"][0] = params
 
     logger.info(f"Using camnames: {params['camnames']}")
     # Also add parent params under the 'experiment' key for compatibility
@@ -629,9 +698,6 @@ def setup_predict(params: dict):
         params["viddir_sil"] = os.path.join(
             params["base_exp_folder"], _DEFAULT_VIDDIR_SIL
         )
-
-    params["experiment"] = {}
-    params["experiment"][0] = params
 
     if params["is_social_dataset"]:
         # repeat parameters for the remaining animals (besides instance_0)
@@ -807,7 +873,9 @@ def get_base_dir(params: dict, dannce_net: bool, prediction: bool) -> Path:
     """Get a base folder given the current settings
 
     For prediction:
-        -> current directory -> videos 
+        If an experiment list is present, infer video parameters from the first recording
+        (exp[0]/com_exp[0]) instead of the current working directory.
+        Otherwise, fall back to the current working directory.
     For (S)DANNCE training:
         -> exp[0].label3d_file > videos
     For COM training:
@@ -815,7 +883,16 @@ def get_base_dir(params: dict, dannce_net: bool, prediction: bool) -> Path:
 
     """
     if prediction:
-        base_dir = Path.cwd()
+        exp_key = "exp" if dannce_net else "com_exp"
+        exp_list = params.get(exp_key)
+        if isinstance(exp_list, list) and len(exp_list) > 0:
+            first_exp = exp_list[0]
+            if "viddir" in first_exp:
+                base_dir = Path(first_exp["viddir"]).parent
+            else:
+                base_dir = Path(first_exp["label3d_file"]).parent
+        else:
+            base_dir = Path.cwd()
     else:  # training network
         if dannce_net:  # (S)DANNCE network
             first_exp = params["exp"][0]

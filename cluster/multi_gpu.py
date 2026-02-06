@@ -275,7 +275,7 @@ class MultiGpuHandler:
         Returns:
             List: Batch parameters list of dictionaries.
         """
-        start_samples = np.arange(0, n_samples, self.n_samples_per_gpu, dtype=np.int)
+        start_samples = np.arange(0, n_samples, self.n_samples_per_gpu, dtype=int)
         max_samples = start_samples + self.n_samples_per_gpu
         batch_params = [
             {"start_sample": sb, "max_num_samples": self.n_samples_per_gpu}
@@ -319,7 +319,7 @@ class MultiGpuHandler:
         Returns:
             List: Batch parameters list of dictionaries.
         """
-        start_samples = np.arange(0, n_samples, self.n_samples_per_gpu, dtype=np.int)
+        start_samples = np.arange(0, n_samples, self.n_samples_per_gpu, dtype=int)
         max_samples = start_samples + self.n_samples_per_gpu
         max_samples[-1] = n_samples
 

@@ -781,7 +781,91 @@ def collate_fn(items):
     except:
         auxs = None
 
-    return volumes, grids, targets, auxs
+    # 2D labels can be a dict of cameras -> numpy arrays/tensors
+    labels_2d = None
+    # Track sample IDs per batch row (optional). This preserves alignment with volumes
+    sample_ids_batch = None
+    try:
+        # Each item may optionally include a list of sample IDs at index 5
+        # We flatten these in the same order as we concatenate batch tensors
+        collected = []
+        for it in items:
+            if len(it) > 5 and it[5] is not None:
+                if isinstance(it[5], (list, tuple)):
+                    collected.extend([str(x) for x in it[5]])
+                else:
+                    collected.append(str(it[5]))
+        if len(collected) > 0:
+            sample_ids_batch = collected
+    except Exception:
+        sample_ids_batch = None
+    
+    if len(items[0]) > 4:
+        sample_l2d = items[0][4]
+        
+        if isinstance(sample_l2d, dict):
+            # Group cameras by their base name (strip experiment prefix)
+            # e.g., "0_Camera1" and "1_Camera1" both map to "Camera1"
+            camera_groups = {}
+            batch_size = len(items)
+            
+            # First pass: identify all unique base camera names
+            for item_idx, it in enumerate(items):
+                l2d = it[4]
+                if isinstance(l2d, dict):
+                    for cam_name, cam_data in l2d.items():
+                        # More robust experiment prefix detection
+                        if '_' in cam_name and cam_name.split('_')[0].isdigit():
+                            # Extract base camera name (remove experiment prefix)
+                            base_cam = '_'.join(cam_name.split('_')[1:])
+                        else:
+                            base_cam = cam_name
+                        
+                        if base_cam not in camera_groups:
+                            camera_groups[base_cam] = {}
+                        
+                        if torch.is_tensor(cam_data):
+                            cam_data = cam_data.detach().cpu().numpy()
+                        
+                        camera_groups[base_cam][item_idx] = cam_data
+
+            # Second pass: create batch tensors for each base camera
+            labels_2d = {}
+            for base_cam, item_data in camera_groups.items():
+                # Get reference shape from first available sample
+                ref_shape = None
+                for item_idx in range(batch_size):
+                    if item_idx in item_data:
+                        ref_shape = item_data[item_idx].shape  # expected: (1, 2, n_keypoints)
+                        break
+                
+                if ref_shape is None:
+                    continue
+                
+                # Build batch tensor with NaN padding for missing samples
+                cam_batches = []
+                for item_idx in range(batch_size):
+                    if item_idx in item_data:
+                        cam_batches.append(item_data[item_idx])
+                    else:
+                        # Pad with NaN for missing camera in this sample
+                        cam_batches.append(np.full(ref_shape, np.nan, dtype=np.float32))
+                
+                # Concatenate along batch dimension
+                labels_2d[base_cam] = np.concatenate(cam_batches, axis=0)
+                
+            # If nothing was gathered, keep None to signal absence
+            if len(labels_2d) == 0:
+                labels_2d = None
+                
+        else:
+            # If it's already a tensor/array, try to cat directly
+            try:
+                labels_2d = torch.cat([item[4] for item in items], dim=0)
+            except Exception:
+                labels_2d = None
+
+    return volumes, grids, targets, auxs, labels_2d, sample_ids_batch
 
 
 def setup_dataloaders(train_dataset, valid_dataset, params):
@@ -797,21 +881,22 @@ def setup_dataloaders(train_dataset, valid_dataset, params):
         valid_batch_size = valid_batch_size * len(params["gpu_id"])
         logger.info(f"Use batch size of {valid_batch_size} for multiple GPUs.")
 
+    # Use single-process data loading to avoid worker segfaults on this cluster.
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=valid_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=0,
+        persistent_workers=False,
     )
     valid_dataloader = torch.utils.data.DataLoader(
         valid_dataset,
         valid_batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=0,
+        persistent_workers=False,
     )
     return train_dataloader, valid_dataloader
 

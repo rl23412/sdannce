@@ -78,7 +78,7 @@ class ConfigBaseTrain:
     epochs: int = 50
     save_period: int = 10
     lr: float = 1e-4
-    lr_scheduler: str | None = None
+    lr_scheduler: dict | None = None
     loss: str = "L1Loss"
     metric: str | None = None
     norm_method: Literal["layer", "instance", "batch"] = "layer"
@@ -178,6 +178,25 @@ class ConfigDANNCETrain(ConfigDANNCEBase, ConfigBaseTrain):
     # adjust post hoc the fraction of unlabeled samples, relative to total samples
     unlabeled_fraction: int | float | None = None
 
+    # Enable training with 2D labels from single camera views
+    train_on_2d: bool = False
+    
+    # Loss stability parameters for 2D reprojection
+    clip_2d_loss: bool = True
+    max_2d_loss_value: float = 70.0
+    clip_projections: bool = True
+    max_projection_coord: float = 5000.0
+    check_3d_bounds: bool = True
+    check_projection_bounds: bool = True
+    gradient_clip_norm: float | None = None
+
+    # 2D Confidence weighting parameters for Label3D integration
+    use_2d_confidence_weighting: bool = False
+    min_confidence_threshold: float = 0.5
+    confidence_loss_weighting_method: str = "linear"  # linear, sigmoid, exponential
+    per_camera_2d_loss_weights: dict | None = None
+    confidence_weighting_strength: float = 1.0  # Scaling factor for confidence weights
+
 
 @dataclass
 class ConfigDANNCEPredict(ConfigDANNCEBase, ConfigBasePredict):
@@ -217,7 +236,7 @@ class ConfigCOMTrain(ConfigBaseTrain, ConfigCOMBase, COMAugmentation):
 
     # Training
     lr: float = 5e-5
-    lr_scheduler: str | None = None
+    lr_scheduler: dict | None = None
     n_channels_out: int = 1
 
 

@@ -52,6 +52,8 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         list_IDs,
         data,
         labels,
+        labels_2d,
+        cameras=None,
         rotation=True,
         random=True,
         chan_num=3,
@@ -78,12 +80,15 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         occlusion=False,
         pairs=None,
         transformed_batch=False,
+        partition=None,  # Add partition parameter
     ):
         """Initialize data generator.
         """
         self.list_IDs = list_IDs
         self.data = data
         self.labels = labels
+        self.labels_2d = labels_2d
+        self.cameras = cameras
         self.rotation = rotation
         self.random = random
         self.chan_num = chan_num
@@ -119,6 +124,11 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         self.pairs = pairs
         if self.pairs is not None:
             self.temporal_chunk_size = len(self.pairs[0])
+
+        self.partition = partition
+        if self.partition is not None:
+            self.train_sample_ids = self.partition.get('train_sampleIDs', [])
+            self.valid_sample_ids = self.partition.get('valid_sampleIDs', [])
 
         self._update_temporal_batch_size()
 
@@ -162,7 +172,33 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         else:
             list_IDs_temp = [self.list_IDs[index]]
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
-        return X, X_grid, y_3d, aux
+
+        # Extract 2D data for each camera and organize properly (quiet)
+        y_2d_cameras = {}
+        
+        try:
+            for ID in list_IDs_temp:
+                if ID not in self.labels_2d:
+                    continue
+                sample_2d_entry = self.labels_2d[ID]
+                if not isinstance(sample_2d_entry, dict) or "data" not in sample_2d_entry:
+                    continue
+                sample_2d_data = sample_2d_entry["data"]  # Get the camera data dict
+                for cam_name, cam_2d_data in sample_2d_data.items():
+                    if cam_name not in y_2d_cameras:
+                        y_2d_cameras[cam_name] = []
+                    y_2d_cameras[cam_name].append(cam_2d_data)
+            
+            # Stack data for each camera: (batch_size, 2, n_keypoints)
+            for cam_name in list(y_2d_cameras.keys()):
+                y_2d_cameras[cam_name] = np.stack(y_2d_cameras[cam_name], axis=0)
+            
+            y_2d = y_2d_cameras
+        except Exception:
+            y_2d = None
+        
+        # print(f"🔍 POSEDATASETFROMMEM GETITEM: Returning sample_ids: {list_IDs_temp}", flush=True)
+        return X, X_grid, y_3d, aux, y_2d
 
     def rot90(self, X):
         """Rotate X by 90 degrees CCW.
@@ -558,7 +594,9 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         self,
         list_IDs,
         labels_3d,
+        labels_2d,
         npydir,
+        cameras=None,
         # batch_size,
         imdir="image_volumes",
         griddir="grid_volumes",
@@ -575,6 +613,7 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         Args:
             list_IDs (List): List of sampleIDs
             labels_3d (Dict): training targets
+            labels_2d (Dict): 2d training targets
             npydir (Dict): path to each npy volume folder for each recording (i.e. experiment)
             batch_size (int): Batch size
             imdir (Text, optional): Name of image volume npy subfolder
@@ -585,9 +624,11 @@ class PoseDatasetNPY(PoseDatasetFromMem):
             sigma (float, optional): For MAX network, size of target Gaussian (mm)
         """
         super(PoseDatasetNPY, self).__init__(
-            list_IDs=list_IDs, data=None, labels=None, **kwargs
+            list_IDs=list_IDs, data=None, labels=None, labels_2d=labels_2d, cameras=cameras, **kwargs
         )
         self.labels_3d = labels_3d
+        self.labels_2d = labels_2d
+        self.cameras = cameras
         self.npydir = npydir
         self.griddir = griddir
         self.imdir = imdir
@@ -598,6 +639,28 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         self.sigma = sigma
         self.auxdir = auxdir
         self.aux = aux
+
+        # Filter out IDs that don't have required NPY files on disk
+        try:
+            filtered_IDs = []
+            missing = 0
+            for ID in list_IDs:
+                try:
+                    eID_str, sID = ID.split("_")
+                    eID = int(eID_str)
+                except Exception:
+                    filtered_IDs.append(ID)
+                    continue
+                im_path = os.path.join(self.npydir[eID], self.imdir, f"0_{sID}.npy")
+                grid_path = os.path.join(self.npydir[eID], self.griddir, f"0_{sID}.npy")
+                if os.path.exists(im_path) and os.path.exists(grid_path):
+                    filtered_IDs.append(ID)
+                else:
+                    missing += 1
+            if missing:
+                self.list_IDs = filtered_IDs
+        except Exception:
+            pass
 
     def __getitem__(self, index):
         """Generate one batch of data.
@@ -619,7 +682,36 @@ class PoseDatasetNPY(PoseDatasetFromMem):
             list_IDs_temp = [self.list_IDs[index]]
         # Generate data
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
-        return X, X_grid, y_3d, aux
+        
+        # Extract 2D data for each camera and organize properly
+        y_2d_cameras = {}
+        
+        try:
+            for ID in list_IDs_temp:
+                if ID not in self.labels_2d:
+                    continue
+                    
+                sample_2d_entry = self.labels_2d[ID]
+                if not isinstance(sample_2d_entry, dict) or "data" not in sample_2d_entry:
+                    continue
+                    
+                sample_2d_data = sample_2d_entry["data"]  # Get the camera data dict
+                
+                for cam_name, cam_2d_data in sample_2d_data.items():
+                    if cam_name not in y_2d_cameras:
+                        y_2d_cameras[cam_name] = []
+                    y_2d_cameras[cam_name].append(cam_2d_data)
+            
+            # Stack data for each camera: (batch_size, 2, n_keypoints)
+            for cam_name in list(y_2d_cameras.keys()):
+                y_2d_cameras[cam_name] = np.stack(y_2d_cameras[cam_name], axis=0)
+            
+            y_2d = y_2d_cameras
+            
+        except Exception as e:
+            print(f"❌ [TRAINING] Exception extracting 2D data for samples {list_IDs_temp}: {e}", flush=True)
+            y_2d = None
+        return X, X_grid, y_3d, aux, y_2d, list_IDs_temp
 
     def _downscale_occluded_views(self, X, occlusion_scores):
         """

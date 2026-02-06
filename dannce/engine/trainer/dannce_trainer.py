@@ -1,5 +1,6 @@
 import csv
 import os
+from datetime import datetime
 
 import imageio
 import numpy as np
@@ -7,8 +8,12 @@ import torch
 from tqdm import tqdm
 
 from dannce.engine.trainer.base_trainer import BaseTrainer
-from dannce.engine.trainer.train_utils import (LossHelper, MetricHelper,
-                                               prepare_batch)
+from dannce.engine.trainer.train_utils import (
+    LossHelper,
+    MetricHelper,
+    prepare_batch,
+    save_2d_reprojection_visualizations,
+)
 from dannce.engine.utils.augmentation import construct_augmented_batch
 from dannce.engine.utils.image import norm_im
 
@@ -29,7 +34,9 @@ class DANNCETrainer(BaseTrainer):
     ):
         super().__init__(**kwargs)
 
-        self.loss = LossHelper(self.params)
+        self.loss = LossHelper(self.params, checkpoint_dir=self.checkpoint_dir, logger=self.logger)
+        
+        # Disable verbose debug log initialization
         self.metrics = MetricHelper(self.params)
         self.device = device
         self.train_dataloader = train_dataloader
@@ -87,6 +94,29 @@ class DANNCETrainer(BaseTrainer):
             )
             self.logger.info(result_msg)
 
+            # Update learning rate scheduler with validation loss
+            if self.lr_scheduler is not None:
+                # For ReduceLROnPlateau, use validation loss
+                scheduler_type = type(self.lr_scheduler).__name__
+                if scheduler_type == "ReduceLROnPlateau":
+                    # Use 2D validation loss if available, otherwise use main loss
+                    val_loss_2d_key = next((k for k in valid_stats.keys() if k.endswith('_2d')), None)
+                    if val_loss_2d_key:
+                        self.lr_scheduler.step(valid_stats[val_loss_2d_key])
+                        self.logger.info(f"LR Scheduler step with {val_loss_2d_key}: {valid_stats[val_loss_2d_key]:.4f}")
+                    else:
+                        # Fallback to first available loss
+                        val_loss = next(iter(valid_stats.values()))
+                        self.lr_scheduler.step(val_loss)
+                        self.logger.info(f"LR Scheduler step with validation loss: {val_loss:.4f}")
+                else:
+                    # For other schedulers (StepLR, etc.), just step
+                    self.lr_scheduler.step()
+                    
+                # Log current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.logger.info(f"Current learning rate: {current_lr:.2e}")
+
             # write stats to csv
             stats_writer.writerow(stats)
             stats_file.close()
@@ -101,7 +131,7 @@ class DANNCETrainer(BaseTrainer):
             self._save_checkpoint(epoch)
 
     def _forward(self, epoch, batch, train=True):
-        volumes, grid_centers, keypoints_3d_gt, aux = prepare_batch(batch, self.device)
+        volumes, grid_centers, keypoints_3d_gt, aux, keypoints_2d_gt, batch_debug_info, sample_ids = prepare_batch(batch, self.device)
 
         if self.visualize_batch:
             self.visualize(epoch, volumes)
@@ -117,6 +147,8 @@ class DANNCETrainer(BaseTrainer):
             volumes = volumes.permute(0, 4, 1, 2, 3)
             aux = aux if aux is None else aux.permute(0, 4, 1, 2, 3)
             keypoints_3d_gt = keypoints_3d_gt.repeat(self.aug_bs, 1, 1)
+            if keypoints_2d_gt is not None:
+                keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
 
         keypoints_3d_pred, heatmaps, _ = self.model(volumes, grid_centers)
 
@@ -124,15 +156,28 @@ class DANNCETrainer(BaseTrainer):
             keypoints_3d_gt, keypoints_3d_pred, heatmaps
         )
 
-        return keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux
+        return (
+            keypoints_3d_gt,
+            keypoints_3d_pred,
+            heatmaps,
+            grid_centers,
+            aux,
+            keypoints_2d_gt,
+            self.train_dataloader.dataset.cameras,
+            sample_ids,
+        )
 
     def _train_epoch(self, epoch):
         self.model.train()
+        
+        # Set epoch for debug logging
+        self.loss.set_epoch(epoch)
 
-        # with torch.autograd.set_detect_anomaly(False):
+        # Anomaly detection disabled - inplace operations have been eliminated
+        # with torch.autograd.set_detect_anomaly(True):
         epoch_loss_dict, epoch_metric_dict = {}, {}
         pbar = tqdm(self.train_dataloader)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             self.optimizer.zero_grad()
             (
                 keypoints_3d_gt,
@@ -140,20 +185,94 @@ class DANNCETrainer(BaseTrainer):
                 heatmaps,
                 grid_centers,
                 aux,
+                keypoints_2d_gt,
+                cameras,
+                sample_ids,
             ) = self._forward(epoch, batch)
 
             total_loss, loss_dict = self.loss.compute_loss(
-                keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux
+                keypoints_3d_gt,
+                keypoints_3d_pred,
+                heatmaps,
+                grid_centers,
+                aux,
+                keypoints_2d_gt=keypoints_2d_gt,
+                cameras=cameras,
+                sample_ids=sample_ids,
             )
-            result = f"Epoch[{epoch}/{self.epochs}] " + "".join(
-                f"train_{loss}: {val:.4f} " for loss, val in loss_dict.items()
-            )
+
+            # Optional concise grad print - disable by default to reduce noise
+            # Build concise oneline status with 2D loss if present
+            keys_sorted = sorted(loss_dict.keys())
+            two_d_keys = [k for k in keys_sorted if k.endswith('_2d')]
+            three_d_keys = [k for k in keys_sorted if not k.endswith('_2d')]
+            parts = []
+            # Prefer 2D loss visibility
+            for k in two_d_keys:
+                parts.append(f"{k}:{loss_dict[k]:.4f}")
+            # Include a small subset of other losses
+            for k in three_d_keys[:2]:
+                parts.append(f"{k}:{loss_dict[k]:.4f}")
+            result = f"Epoch[{epoch}/{self.epochs}] " + " ".join(parts)
             pbar.set_description(result)
+            # Remove duplicate print - progress bar already shows this info
+
+            # Optional: report grad norm every batch (compact)
+            # Note: keypoints_3d_pred is not a leaf tensor and doesn't have .grad
+            # Gradient access removed to prevent autograd warnings and errors
 
             total_loss.backward()
+            
+            # Apply gradient clipping if specified
+            clip_threshold = self.params.get('gradient_clip_norm')
+            if clip_threshold is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    clip_threshold
+                )
+                # Log if gradient was clipped (only for high values to avoid spam)
+                if grad_norm > clip_threshold * 2:
+                    print(f"   ⚡ Gradient norm clipped: {grad_norm:.2f} -> {clip_threshold}", flush=True)
+            
             self.optimizer.step()
 
             epoch_loss_dict = self._update_step(epoch_loss_dict, loss_dict)
+
+            # Save 2D reprojection visualizations for first 3 batches per epoch
+            try:
+                train_on_2d = self.params.get("train_on_2d", False)
+                
+                if epoch == self.start_epoch and batch_idx < 3 and train_on_2d:
+                    with torch.no_grad():
+                        vols_for_vis = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else None
+                        
+                        # Get sample_id directly from the dataset partition
+                        sample_id = self.train_dataloader.dataset.train_sample_ids[batch_idx]
+
+                        save_2d_reprojection_visualizations(
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            volumes=vols_for_vis,
+                            kpts_pred=keypoints_3d_pred,
+                            keypoints_2d_gt=keypoints_2d_gt,
+                            cameras=cameras,
+                            params=self.params,
+                            checkpoint_dir=self.checkpoint_dir,
+                            dataset=self.train_dataloader.dataset,
+                            batch=batch,  # Pass original batch for accessing images
+                            sample_id=sample_id, # Pass single sample ID
+                        )
+                else:
+                    if not train_on_2d:
+                        pass
+                    elif epoch != self.start_epoch:
+                        pass
+                    elif batch_idx >= 3:
+                        pass
+            except Exception as e:
+                print(f"❌ VIS ERROR: {e}")
+                import traceback
+                traceback.print_exc()
 
             if len(self.metrics.names) != 0:
                 metric_dict = self.metrics.evaluate(
@@ -162,8 +281,7 @@ class DANNCETrainer(BaseTrainer):
                 )
                 epoch_metric_dict = self._update_step(epoch_metric_dict, metric_dict)
 
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        # Note: LR scheduler step is called after validation in train() method
 
         epoch_loss_dict, epoch_metric_dict = (
             self._average(epoch_loss_dict),
@@ -173,25 +291,62 @@ class DANNCETrainer(BaseTrainer):
 
     def _valid_epoch(self, epoch):
         self.model.eval()
+        
+        # Set epoch for debug logging
+        self.loss.set_epoch(epoch)
 
         epoch_loss_dict = {}
         epoch_metric_dict = {}
 
         pbar = tqdm(self.valid_dataloader)
         with torch.no_grad():
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar):
                 (
                     keypoints_3d_gt,
                     keypoints_3d_pred,
                     heatmaps,
                     grid_centers,
                     aux,
+                    keypoints_2d_gt,
+                    cameras,
+                    sample_ids,
                 ) = self._forward(epoch, batch, False)
 
                 _, loss_dict = self.loss.compute_loss(
-                    keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux
+                    keypoints_3d_gt,
+                    keypoints_3d_pred,
+                    heatmaps,
+                    grid_centers,
+                    aux,
+                    keypoints_2d_gt=keypoints_2d_gt,
+                    cameras=cameras,
+                    sample_ids=sample_ids,
                 )
                 epoch_loss_dict = self._update_step(epoch_loss_dict, loss_dict)
+
+                # Optionally visualize first 3 validation batches as well
+                try:
+                    if epoch == self.start_epoch and batch_idx < 3 and self.params.get("train_on_2d", False):
+                        vols_for_vis = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else None
+                        
+                        # Get sample_id directly from the dataset partition
+                        sample_id = self.valid_dataloader.dataset.valid_sample_ids[batch_idx]
+                        
+                        save_2d_reprojection_visualizations(
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            volumes=vols_for_vis,
+                            kpts_pred=keypoints_3d_pred,
+                            keypoints_2d_gt=keypoints_2d_gt,
+                            cameras=cameras,
+                            params=self.params,
+                            checkpoint_dir=self.checkpoint_dir,
+                            dataset=self.valid_dataloader.dataset,
+                            batch=batch,
+                            sample_id=sample_id, # Pass single sample ID
+                        )
+                except Exception:
+                    pass
 
                 if len(self.metrics.names) != 0:
                     metric_dict = self.metrics.evaluate(
