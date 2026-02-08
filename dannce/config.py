@@ -2,7 +2,7 @@ import os
 import warnings
 from copy import deepcopy
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 import itertools
 
 import imageio
@@ -407,19 +407,30 @@ def check_unrecognized_params(params: dict):
         raise ValueError(msg)
 
 
-def build_params(base_config: str, dannce_net: bool):
-    """Build parameters dictionary from base config and io.yaml
+def build_params(
+    base_config: str, dannce_net: bool, io_config_override: Optional[str] = None
+):
+    """Build parameters dictionary from base config and io.yaml.
+
+    Note: `--io-config` is a CLI override used to point to an alternate io.yaml.
+    We need to respect that override when initially loading the io.yaml; simply
+    overriding `params["io_config"]` after parsing is too late.
 
     Args:
         base_config (Text): Path to base configuration .yaml.
         dannce_net (bool): If True, use dannce net defaults.
+        io_config_override (Optional[Text]): If provided, load this io.yaml
+            instead of the one referenced by `base_config`.
 
     Returns:
         Dict: Parameters dictionary.
     """
     base_params = read_config(base_config)
     base_params = make_paths_safe(base_params)
-    params = read_config(base_params["io_config"])
+    io_config_path = io_config_override or base_params["io_config"]
+    # Keep params consistent for downstream code/logging.
+    base_params["io_config"] = io_config_path
+    params = read_config(io_config_path)
     params = make_paths_safe(params)
     params = inherit_config(params, base_params, list(base_params.keys()))
     check_unrecognized_params(params)

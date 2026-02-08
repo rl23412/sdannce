@@ -86,8 +86,11 @@ def build_clarg_params(
     Returns:
         Dict: Parameters dictionary.
     """
-    # Get the params specified in base config and io.yaml
-    params = build_params(args.base_config, dannce_net)
+    # Get the params specified in base config and io.yaml.
+    # Important: if the user passes `--io-config`, we must load that file here;
+    # overriding `params["io_config"]` later is too late to affect which
+    # experiments are included.
+    params = build_params(args.base_config, dannce_net, io_config_override=args.io_config)
 
     # Combine those params with the clargs
     params = combine(params, args, dannce_net)
