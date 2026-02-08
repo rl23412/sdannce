@@ -244,6 +244,8 @@ def infer_dannce(
     """
     start_ind, end_ind, bs, _ = infer_dannce_inference_range(params, generator)
     save_data = {}
+    valid_sampleIDs = partition.get("valid_sampleIDs", [])
+    n_valid = len(valid_sampleIDs)
 
     if save_heatmaps:
         save_path = os.path.join(params["dannce_predict_dir"], "heatmaps")
@@ -317,7 +319,12 @@ def infer_dannce(
             pred = pred[0].detach().cpu().numpy()
             for j in range(pred.shape[0]):
                 pred_max = probmap[j]
-                sampleID = partition["valid_sampleIDs"][i * bs + j]
+                global_idx = i * bs + j
+                # Some generators pad the final batch to a full batch size. Skip padded
+                # entries that do not have corresponding sample IDs.
+                if global_idx >= n_valid:
+                    continue
+                sampleID = valid_sampleIDs[global_idx]
                 save_data[idx * bs + j] = {
                     "pred_max": pred_max,
                     "pred_coord": pred[j],
@@ -335,7 +342,10 @@ def infer_dannce(
                 (xcoord, ycoord, zcoord,) = image_utils.plot_markers_3d_torch(preds)
                 coord = torch.stack([xcoord, ycoord, zcoord])
                 pred_log = pred_max.log() - pred_total.log()
-                sampleID = partition["valid_sampleIDs"][i * bs + j]
+                global_idx = i * bs + j
+                if global_idx >= n_valid:
+                    continue
+                sampleID = valid_sampleIDs[global_idx]
 
                 save_data[idx * bs + j] = {
                     "pred_max": pred_max.cpu().numpy(),
