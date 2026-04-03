@@ -257,6 +257,52 @@ def check_config(params: dict, dannce_net: bool, prediction: bool):
     if dannce_net:
         # check_net_expval(params)
         check_vmin_vmax(params)
+        if not prediction:
+            _apply_train_on_2d_default_visibility(params)
+
+
+def _apply_train_on_2d_default_visibility(params: dict):
+    """Promote the geometry-only learned visibility path as the default for train_on_2d."""
+    if not params.get("train_on_2d", False):
+        return
+    if not params.get("train_on_2d_use_default_learned_visibility", True):
+        return
+
+    default_exclude = _param_defaults_dannce["exclude_occluded_2d"]
+    default_mode = _param_defaults_dannce["exclude_occluded_2d_mode"]
+    default_learned = _param_defaults_dannce["learned_visibility_enabled"]
+    default_warmup = _param_defaults_dannce["learned_visibility_warmup_epochs"]
+    default_reproj = _param_defaults_dannce["exclude_occluded_2d_reproj_only_from_stored3d"]
+
+    updates = {}
+
+    if params.get("exclude_occluded_2d", default_exclude) == default_exclude:
+        updates["exclude_occluded_2d"] = True
+
+    selected_mode = params.get("exclude_occluded_2d_mode", default_mode)
+    if selected_mode == default_mode:
+        selected_mode = "learned"
+        updates["exclude_occluded_2d_mode"] = selected_mode
+
+    if selected_mode == "learned":
+        if params.get("learned_visibility_enabled", default_learned) == default_learned:
+            updates["learned_visibility_enabled"] = True
+        if params.get("learned_visibility_warmup_epochs", default_warmup) == default_warmup:
+            updates["learned_visibility_warmup_epochs"] = 5
+        if (
+            params.get("exclude_occluded_2d_reproj_only_from_stored3d", default_reproj)
+            == default_reproj
+        ):
+            updates["exclude_occluded_2d_reproj_only_from_stored3d"] = True
+
+    if updates:
+        params.update(updates)
+        summary = ", ".join(f"{key}={value}" for key, value in updates.items())
+        logger.info(
+            "Applying default train_on_2d visibility settings: "
+            f"{summary}. Set train_on_2d_use_default_learned_visibility=false "
+            "to opt out."
+        )
 
 
 def check_vmin_vmax(params):
@@ -390,6 +436,12 @@ def check_unrecognized_params(params: dict):
         "check_3d_bounds",
         "check_projection_bounds",
         "gradient_clip_norm",
+        "lr_scheduler_monitor",
+        # Optional early-stopping threshold on validation MPJPE/3D euclidean distance.
+        "stop_when_val_euclidean_distance_3D_below",
+        "temporal_chunk_size",
+        # Optional cached partition file used to force training/validation IDs.
+        "precomputed_partition",
     ])
     for key in params:
         if key in allowed_extra_keys:
@@ -517,6 +569,99 @@ def setup_train(params: dict):
     elif params["dataset"] == "pair":
         params["n_channels_out"] = 12
 
+    if params.get("exclude_occluded_2d", False):
+        if params.get("n_instances", 1) != 1:
+            raise ValueError(
+                "exclude_occluded_2d currently supports only single-animal training "
+                "(n_instances == 1)."
+            )
+
+        mode = params.get("exclude_occluded_2d_mode", "capsule_raycast")
+        if mode not in {"capsule_raycast", "learned", "body_side_learned"}:
+            raise ValueError(
+                f"Unsupported exclude_occluded_2d_mode={mode!r}. "
+                "Supported modes are 'capsule_raycast', 'learned', and "
+                "'body_side_learned'."
+            )
+
+        params["return_full2d"] = True
+
+    if params.get("filter_samples_without_finite_2d", False):
+        if int(params.get("filter_samples_without_finite_2d_min_points", 1)) < 1:
+            raise ValueError(
+                "filter_samples_without_finite_2d_min_points must be >= 1."
+            )
+        if params.get("use_temporal", False):
+            raise ValueError(
+                "filter_samples_without_finite_2d currently supports only "
+                "non-temporal training."
+            )
+
+    if params.get("exclude_occluded_2d_com_filter", False):
+        if int(params.get("exclude_occluded_2d_com_filter_window", 5)) < 1:
+            raise ValueError(
+                "exclude_occluded_2d_com_filter_window must be >= 1."
+            )
+        if float(params.get("exclude_occluded_2d_com_filter_thresh_px", 60.0)) <= 0:
+            raise ValueError(
+                "exclude_occluded_2d_com_filter_thresh_px must be > 0."
+            )
+
+    if params.get("exclude_occluded_2d_mode", "capsule_raycast") in {
+        "learned",
+        "body_side_learned",
+    }:
+        torso_quantile = float(
+            params.get("exclude_occluded_2d_learned_torso_quantile", 0.95)
+        )
+        if not (0.5 <= torso_quantile < 1.0):
+            raise ValueError(
+                "exclude_occluded_2d_learned_torso_quantile must be in [0.5, 1.0)."
+            )
+        if float(params.get("exclude_occluded_2d_learned_torso_margin", 1.05)) <= 0:
+            raise ValueError(
+                "exclude_occluded_2d_learned_torso_margin must be > 0."
+            )
+
+    if params.get("learned_visibility_enabled", False):
+        if not params.get("exclude_occluded_2d", False):
+            raise ValueError(
+                "learned_visibility_enabled requires exclude_occluded_2d=True."
+            )
+        if not params.get("train_on_2d", False):
+            raise ValueError(
+                "learned_visibility_enabled requires train_on_2d=True."
+            )
+        if params.get("exclude_occluded_2d_mode", "capsule_raycast") != "learned":
+            raise ValueError(
+                "learned_visibility_enabled requires exclude_occluded_2d_mode='learned'."
+            )
+        if params.get("multi_gpu_train", False):
+            raise ValueError(
+                "learned_visibility_enabled currently supports only single-GPU training."
+            )
+        params["return_full2d"] = True
+
+    stop_bce_metric = str(
+        params.get("learned_visibility_stop_bce_metric", "val")
+    ).lower()
+    if stop_bce_metric not in {"train", "val"}:
+        raise ValueError(
+            "learned_visibility_stop_bce_metric must be 'train' or 'val'."
+        )
+
+    stop_bce_after_epoch = int(params.get("learned_visibility_stop_bce_after_epoch", 1))
+    if stop_bce_after_epoch < 1:
+        raise ValueError(
+            "learned_visibility_stop_bce_after_epoch must be >= 1."
+        )
+
+    stop_bce_below = params.get("learned_visibility_stop_bce_below", None)
+    if stop_bce_below is not None and float(stop_bce_below) < 0:
+        raise ValueError(
+            "learned_visibility_stop_bce_below must be >= 0 when provided."
+        )
+
     params = adjust_loss_params(params)
 
     # generator params
@@ -550,6 +695,26 @@ def setup_train(params: dict):
         params["n_rand_views"] = params["n_views"]
         params["rand_view_replace"] = True
 
+    # Guard against a common pathological setup in 3-camera projects:
+    # sampling n_views with replacement can duplicate one camera and drop another.
+    # When this happens, switch to shuffled non-replacement sampling.
+    if (
+        params["n_rand_views"] is not None
+        and params["rand_view_replace"]
+        and params["n_rand_views"] >= params["n_views"]
+        and not randflag
+    ):
+        logger.warning(
+            "n_rand_views >= n_views with replacement duplicates camera views; "
+            "switching to shuffled non-replacement sampling."
+        )
+        params["rand_view_replace"] = False
+        randflag = True
+
+    generator_gpu_id = params.get("gpu_id", "0")
+    if isinstance(generator_gpu_id, (list, tuple)):
+        generator_gpu_id = generator_gpu_id[0] if len(generator_gpu_id) > 0 else "0"
+
     base_params = {
         "dim_in": (
             params["crop_height"][1] - params["crop_height"][0],
@@ -577,6 +742,7 @@ def setup_train(params: dict):
         # "chunks": total_chunks,
         "mono": params["mono"],
         "mirror": params["mirror"],
+        "gpu_id": generator_gpu_id,
     }
 
     # dataset params

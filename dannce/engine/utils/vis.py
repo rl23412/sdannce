@@ -8,10 +8,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io as sio
 import skimage.transform
+import torch
 import tqdm
 from matplotlib.animation import FFMpegWriter
 
+from dannce.engine.data.processing import initialize_all_vids
 from dannce.engine.data.io import load_sync
+from dannce.engine.data.video import LoadVideoFrame
 from dannce.engine.skeletons.utils import load_body_profile
 from dannce.engine.utils.projection import (distortPoints, load_cameras,
                                             project_to_2d)
@@ -34,7 +37,7 @@ LINE_COLOR = {
 def visualize_pose_predictions(
     exproot: str,
     expfolder: str = "DANNCE/predict",
-    datafile: str = "save_data_AVG0.mat",
+    datafile: str = "save_data_AVG.mat",
     datafile_start: int = 0,
     n_frames: int = 10,
     start_frame: int = 0,
@@ -53,6 +56,17 @@ def visualize_pose_predictions(
     vid_path = os.path.join(exproot, "videos")
     pred_path = os.path.join(exproot, expfolder)
     datafile_path = os.path.join(pred_path, datafile)
+    if not os.path.exists(datafile_path):
+        fallback_map = {
+            "save_data_AVG.mat": "save_data_AVG0.mat",
+            "save_data_AVG0.mat": "save_data_AVG.mat",
+        }
+        fallback_name = fallback_map.get(datafile)
+        if fallback_name is not None:
+            fallback_path = os.path.join(pred_path, fallback_name)
+            if os.path.exists(fallback_path):
+                datafile = fallback_name
+                datafile_path = fallback_path
     save_path = os.path.join(exproot, expfolder, "vis")
     
     assert os.path.exists(vid_path), f"Video directory {vid_path} does not exist"
@@ -221,6 +235,132 @@ def visualize_pose_predictions(
     for vid in vids:
         vid.close()
     return savepath
+
+
+def save_visibility_overlay_previews(
+    params,
+    labels_2d,
+    sample_ids,
+    visibility_logits,
+    visibility_targets,
+    output_dir,
+    camera_order=None,
+    threshold=0.5,
+    max_samples=4,
+):
+    if visibility_logits is None or visibility_targets is None:
+        return []
+
+    if camera_order is None:
+        camera_order = list(visibility_targets.keys())
+    if len(camera_order) == 0:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    sample_ids = [str(sample_id) for sample_id in sample_ids[:max_samples]]
+    exps = sorted(
+        {
+            int(sample_id.split("_")[0])
+            for sample_id in sample_ids
+            if "_" in sample_id and sample_id.split("_")[0].isdigit()
+        }
+    )
+    if len(exps) == 0:
+        exps = [0]
+
+    vidreaders = initialize_all_vids(params, labels_2d, exps, pathonly=True)
+    camnames = {exp_idx: params["experiment"][exp_idx]["camnames"] for exp_idx in exps}
+    chunks = {}
+    for exp_idx in exps:
+        chunks.update(params["experiment"][exp_idx]["chunks"])
+    frame_loader = LoadVideoFrame(chunks, vidreaders, camnames, predict_flag=False)
+
+    predicted_visibility = torch.sigmoid(visibility_logits.detach().cpu()) >= threshold
+    target_visibility = _visibility_targets_to_numpy(visibility_targets, camera_order)
+
+    saved_paths = []
+    for sample_offset, sample_id in enumerate(sample_ids):
+        sample_entry = labels_2d.get(sample_id)
+        if not isinstance(sample_entry, dict):
+            continue
+        exp_idx = int(sample_id.split("_")[0]) if "_" in sample_id else 0
+        frame_map = sample_entry.get("frames", {})
+        data_map = sample_entry.get("data", {})
+
+        for cam_idx, base_cam in enumerate(camera_order):
+            sample_cam = _resolve_sample_camera_key(frame_map, exp_idx, base_cam)
+            if sample_cam is None or sample_cam not in data_map:
+                continue
+
+            points_2d = np.asarray(data_map[sample_cam], dtype=np.float32)
+            frame_idx = int(frame_map[sample_cam])
+            frame = frame_loader.load_vid_frame(frame_idx, sample_cam)
+
+            pred_mask = predicted_visibility[sample_offset, cam_idx].numpy()
+            target_mask = target_visibility[cam_idx][sample_offset]
+
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            ax.imshow(frame)
+            if points_2d.ndim == 2 and points_2d.shape[0] == 2:
+                xs, ys = points_2d[0], points_2d[1]
+                finite = np.isfinite(xs) & np.isfinite(ys)
+                for joint_idx in np.where(finite)[0]:
+                    color = "lime" if pred_mask[joint_idx] else "crimson"
+                    ring_color = "white" if target_mask[joint_idx] else "yellow"
+                    ax.scatter(
+                        xs[joint_idx],
+                        ys[joint_idx],
+                        s=55,
+                        facecolors="none",
+                        edgecolors=ring_color,
+                        linewidths=1.0,
+                    )
+                    ax.scatter(
+                        xs[joint_idx],
+                        ys[joint_idx],
+                        s=20,
+                        c=color,
+                        edgecolors="none",
+                    )
+
+            ax.set_title(f"{sample_id} {base_cam}")
+            ax.axis("off")
+            save_path = os.path.join(output_dir, f"{sample_id}_{base_cam}.png")
+            fig.tight_layout()
+            fig.savefig(save_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+            saved_paths.append(save_path)
+
+    return saved_paths
+
+
+def _resolve_sample_camera_key(frame_map, exp_idx, base_cam):
+    candidates = [
+        base_cam,
+        f"{exp_idx}_{base_cam}",
+        f"0_{base_cam}",
+    ]
+    for candidate in candidates:
+        if candidate in frame_map:
+            return candidate
+
+    for cam_name in frame_map:
+        if str(cam_name).endswith(base_cam):
+            return cam_name
+    return None
+
+
+def _visibility_targets_to_numpy(visibility_targets, camera_order):
+    targets = []
+    for cam_name in camera_order:
+        cam_data = visibility_targets[cam_name]
+        if torch.is_tensor(cam_data):
+            cam_data = cam_data.detach().cpu().numpy()
+        cam_data = np.asarray(cam_data, dtype=bool)
+        if cam_data.ndim == 1:
+            cam_data = cam_data[None, :]
+        targets.append(cam_data)
+    return targets
     
 
 def draw_voxels(voxels, ax, shape=(8, 8, 8), norm=True, alpha=0.1):
@@ -283,7 +423,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--datafile",
         type=str,
-        default="save_data_AVG0.mat",
+        default="save_data_AVG.mat",
         help="name of the saved prediction file",
     )
     parser.add_argument(

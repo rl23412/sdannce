@@ -20,6 +20,7 @@ from dannce.engine.models.segmentation import get_instance_segmentation_model
 from dannce.engine.utils.debug import write_debug
 from dannce.engine.utils.experiment import (make_folder, set_device,
                                             set_random_seed)
+from dannce.engine.utils.visibility import populate_occlusion_visibility
 from dannce.engine.utils.save import (save_params_pickle, save_params_yaml,
                                       write_com_file)
 from dannce.engine.skeletons.utils import SYMMETRY, load_body_profile
@@ -62,6 +63,50 @@ def set_dataset(params: Dict):
     return dataset_preparer
 
 
+def _com_collate_fn(batch):
+    """Collate COM batches while keeping images in NCHW torch format."""
+    X = torch.cat(
+        [torch.from_numpy(item[0]).permute(0, 3, 1, 2).float() for item in batch],
+        dim=0,
+    )
+    y = torch.cat(
+        [torch.from_numpy(item[1]).permute(0, 3, 1, 2).float() for item in batch],
+        dim=0,
+    )
+    return X, y
+
+
+def _count_finite_2d_points(sample_entry: Dict) -> int:
+    total = 0
+    for cam_data in sample_entry.get("data", {}).values():
+        points_2d = np.asarray(cam_data)
+        if points_2d.ndim < 3 and points_2d.ndim != 2:
+            continue
+        if points_2d.ndim == 2:
+            finite_mask = np.isfinite(points_2d).all(axis=0)
+        else:
+            finite_mask = np.isfinite(points_2d).all(axis=1)
+        total += int(np.sum(finite_mask))
+    return total
+
+
+def _filter_samples_without_finite_2d(
+    samples,
+    datadict: Dict,
+    min_points: int,
+):
+    kept_samples = []
+    dropped_samples = []
+    for sample_id in samples:
+        sample_entry = datadict.get(sample_id, {})
+        if _count_finite_2d_points(sample_entry) >= min_points:
+            kept_samples.append(sample_id)
+        else:
+            dropped_samples.append(sample_id)
+
+    return kept_samples, dropped_samples
+
+
 def make_dataset(
     params: Dict,
     base_params: Dict,
@@ -92,6 +137,23 @@ def make_dataset(
     cameras, datadict, params = serve_data_DANNCE.prepend_experiment(
         params, datadict, num_experiments, camnames, cameras
     )
+
+    if params.get("filter_samples_without_finite_2d", False):
+        min_points = int(params.get("filter_samples_without_finite_2d_min_points", 1))
+        filtered_samples, dropped_samples = _filter_samples_without_finite_2d(
+            samples=samples,
+            datadict=datadict,
+            min_points=min_points,
+        )
+        logger.info(
+            "Filtered samples without at least {} finite 2D targets after landmark "
+            "dropping: kept {} / {}, dropped {}.",
+            min_points,
+            len(filtered_samples),
+            len(samples),
+            len(dropped_samples),
+        )
+        samples = np.asarray(filtered_samples, dtype=object)
 
     # make train/valid splits
     partition = processing.make_data_splits(
@@ -192,6 +254,24 @@ def make_dataset(
 
         pairs = None
         params["is_social_dataset"] = False
+
+    if params.get("exclude_occluded_2d", False):
+        visibility_sample_ids = np.unique(
+            np.concatenate(
+                (
+                    np.asarray(partition.get("train_sampleIDs", []), dtype=object),
+                    np.asarray(partition.get("valid_sampleIDs", []), dtype=object),
+                )
+            )
+        )
+        populate_occlusion_visibility(
+            datadict=datadict,
+            datadict_3d=datadict_3d,
+            cameras=cameras,
+            sample_ids=visibility_sample_ids,
+            params=params,
+            com3d_dict=com3d_dict,
+        )
 
     # Dump the params into file for reproducibility
     save_params_pickle(params)
@@ -383,6 +463,7 @@ def make_rat7m(
     # make train/valid splits
     partition = processing.make_data_splits(
         samples,
+        datadict,
         params,
         params["dannce_train_dir"],
         num_experiments,
@@ -394,6 +475,24 @@ def make_rat7m(
         np.random.seed(10241024)
         partition["train_sampleIDs"] = np.random.choice(
             partition["train_sampleIDs"], 2000
+        )
+
+    if params.get("exclude_occluded_2d", False):
+        visibility_sample_ids = np.unique(
+            np.concatenate(
+                (
+                    np.asarray(partition.get("train_sampleIDs", []), dtype=object),
+                    np.asarray(partition.get("valid_sampleIDs", []), dtype=object),
+                )
+            )
+        )
+        populate_occlusion_visibility(
+            datadict=datadict,
+            datadict_3d=datadict_3d,
+            cameras=cameras,
+            sample_ids=visibility_sample_ids,
+            params=params,
+            com3d_dict=com3d_dict,
         )
 
     # Dump the params into file for reproducibility
@@ -637,6 +736,13 @@ def _make_data_npy(
         genfunc = generator.DataGenerator_3Dconv_social
 
     valid_params = {**base_params, **spec_params}
+    npy_cache_device = str(params.get("npy_cache_device", "cuda")).lower()
+    if npy_cache_device == "cpu":
+        valid_params["gpu_id"] = "cpu"
+        logger.warning(
+            "Using CPU for npy volume caching (npy_cache_device=cpu). "
+            "This is slower but avoids CUDA preprocessing faults."
+        )
 
     if len(missing_samples) != 0:
         npy_generator = genfunc(
@@ -952,6 +1058,7 @@ def _make_data_mem(
         "labels": y_train,
         "labels_2d": datadict,
         "cameras": cameras,
+        "sample_id_lookup": partition["train_sampleIDs"],
     }
     args_train = {
         **args_train,
@@ -972,6 +1079,7 @@ def _make_data_mem(
         "labels_2d": datadict,
         "cameras": cameras,
         "aux_labels": y_valid_aux,
+        "sample_id_lookup": partition["valid_sampleIDs"],
     }
     args_valid = {
         **args_valid,
@@ -1173,7 +1281,7 @@ def make_data_com(params, train_params, valid_params):
 
     # make train/valid splits
     partition = processing.make_data_splits(
-        samples, params, params["com_train_dir"], num_experiments
+        samples, datadict, params, params["com_train_dir"], num_experiments
     )
 
     # Initialize video objects
@@ -1195,8 +1303,9 @@ def make_data_com(params, train_params, valid_params):
 
     # Set up generators
     labels = datadict
-    dh = (params["crop_height"][1] - params["crop_height"][0]) // params["downfac"]
-    dw = (params["crop_width"][1] - params["crop_width"][0]) // params["downfac"]
+    downfac = params["downfac"] if params["downfac"] is not None else 1
+    dh = (params["crop_height"][1] - params["crop_height"][0]) // downfac
+    dw = (params["crop_width"][1] - params["crop_width"][0]) // downfac
     params["input_shape"] = (dh, dw)
     # effective n_channels, which is different if using a mirror arena configuration
     eff_n_channels_out = (
@@ -1222,88 +1331,39 @@ def make_data_com(params, train_params, valid_params):
         **valid_params,
     )
 
-    logger.info("Loading data")
-    ims_train = np.zeros(
-        (ncams * len(partition["train_sampleIDs"]), dh, dw, params["chan_num"],),
-        dtype="float32",
-    )
-    y_train = np.zeros(
-        (ncams * len(partition["train_sampleIDs"]), dh, dw, eff_n_channels_out),
-        dtype="float32",
-    )
-    ims_valid = np.zeros(
-        (ncams * len(partition["valid_sampleIDs"]), dh, dw, params["chan_num"],),
-        dtype="float32",
-    )
-    y_valid = np.zeros(
-        (ncams * len(partition["valid_sampleIDs"]), dh, dw, eff_n_channels_out),
-        dtype="float32",
+    logger.info(
+        f'***TRAIN:VALIDATION samples = {len(partition["train_sampleIDs"])}:{len(partition["valid_sampleIDs"])}***'
     )
 
-    for i in tqdm(range(len(partition["train_sampleIDs"]))):
-        ims = train_generator.__getitem__(i)
-        ims_train[i * ncams : (i + 1) * ncams] = ims[0]
-        y_train[i * ncams : (i + 1) * ncams] = ims[1]
-
-    for i in tqdm(range(len(partition["valid_sampleIDs"]))):
-        ims = valid_generator.__getitem__(i)
-        ims_valid[i * ncams : (i + 1) * ncams] = ims[0]
-        y_valid[i * ncams : (i + 1) * ncams] = ims[1]
-
-    write_debug(params, ims_train, ims_valid, y_train)
-
-    train_generator.close_all_readers()
-    valid_generator.close_all_readers()
-
-    train_generator = dataset.COMDatasetFromMem(
-        np.arange(ims_train.shape[0]),
-        ims_train,
-        y_train,
-        batch_size=ncams,
-        augment_hue=params["augment_hue"],
-        augment_brightness=params["augment_brightness"],
-        augment_rotation=params["augment_rotation"],
-        augment_shear=params["augment_hue"],
-        augment_shift=params["augment_brightness"],
-        augment_zoom=params["augment_rotation"],
-        bright_val=params["augment_bright_val"],
-        hue_val=params["augment_hue_val"],
-        shift_val=params["augment_shift_val"],
-        rotation_val=params["augment_rotation_val"],
-        shear_val=params["augment_shear_val"],
-        zoom_val=params["augment_zoom_val"],
-        chan_num=params["chan_num"],
+    com_num_workers = max(0, int(os.environ.get("DANNCE_COM_NUM_WORKERS", "0")))
+    com_prefetch_factor = max(
+        2, int(os.environ.get("DANNCE_COM_PREFETCH_FACTOR", "2"))
     )
-    valid_generator = dataset.COMDatasetFromMem(
-        np.arange(ims_valid.shape[0]),
-        ims_valid,
-        y_valid,
-        batch_size=ncams,
-        shuffle=False,
-        chan_num=params["chan_num"],
-    )
-
-    logger.info(f'***TRAIN:VALIDATION = {ims_train.shape[0]}:{ims_valid.shape[0]}***')
-
-    def collate_fn(batch):
-        X = torch.cat([item[0] for item in batch], dim=0)
-        y = torch.cat([item[1] for item in batch], dim=0)
-
-        return X, y
+    common_loader_kwargs = {
+        "collate_fn": _com_collate_fn,
+        "num_workers": com_num_workers,
+    }
+    if com_num_workers > 0:
+        common_loader_kwargs.update(
+            {
+                "persistent_workers": True,
+                "prefetch_factor": com_prefetch_factor,
+                "pin_memory": torch.cuda.is_available(),
+                "multiprocessing_context": "spawn",
+            }
+        )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_generator,
         batch_size=params["batch_size"],
         shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,
+        **common_loader_kwargs,
     )
     valid_dataloader = torch.utils.data.DataLoader(
         valid_generator,
         batch_size=1,
         shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
+        **common_loader_kwargs,
     )
 
     return train_dataloader, valid_dataloader
@@ -1720,10 +1780,37 @@ def make_pair(
 def compute_segment_length_priors(params, pose3d, ref_segment_idx=3):
     notnan = ~np.isnan(pose3d.sum(-1).sum(-1))
     pose3d = pose3d[notnan]
-    
-    body_profile = params['loss'].get('body_profile', 'rat23')
-    limbs = np.array(load_body_profile(body_profile)["limbs"])
-    
+
+    loss_cfg = params.get("loss", {})
+    bone_cfg = loss_cfg.get("BoneLengthLoss", {}) if isinstance(loss_cfg, dict) else {}
+    if not isinstance(bone_cfg, dict):
+        bone_cfg = {}
+
+    # BoneLengthLoss body_profile is stored under params["loss"]["BoneLengthLoss"].
+    # Fall back to top-level skeleton only if absent.
+    body_profile = bone_cfg.get("body_profile", params.get("skeleton", "rat23"))
+    limbs = np.array(load_body_profile(body_profile)["limbs"], dtype=np.int64)
+
+    # Guard against stale/incompatible skeleton profiles in configs.
+    n_kpts = pose3d.shape[1]
+    valid = (limbs[:, 0] < n_kpts) & (limbs[:, 1] < n_kpts)
+    if not np.all(valid):
+        invalid = limbs[~valid].tolist()
+        logger.warning(
+            f"Ignoring {len(invalid)} invalid limbs for body_profile={body_profile}; "
+            f"pose3d has {n_kpts} keypoints. invalid={invalid[:5]}"
+        )
+        limbs = limbs[valid]
+    if limbs.size == 0:
+        raise ValueError(
+            f"No valid limbs left for body_profile={body_profile} with n_keypoints={n_kpts}"
+        )
+    if ref_segment_idx >= len(limbs):
+        logger.warning(
+            f"ref_segment_idx={ref_segment_idx} out of range for {len(limbs)} limbs; using 0."
+        )
+        ref_segment_idx = 0
+
     kpts_from = pose3d[:, limbs[:, 0]]
     kpts_to = pose3d[:, limbs[:, 1]]
     segment_lengths = np.linalg.norm(kpts_from - kpts_to, axis=-1) #[n_samples, n_segments]

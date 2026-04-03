@@ -81,6 +81,7 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         pairs=None,
         transformed_batch=False,
         partition=None,  # Add partition parameter
+        sample_id_lookup=None,
     ):
         """Initialize data generator.
         """
@@ -129,6 +130,9 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         if self.partition is not None:
             self.train_sample_ids = self.partition.get('train_sampleIDs', [])
             self.valid_sample_ids = self.partition.get('valid_sampleIDs', [])
+        self.sample_id_lookup = (
+            list(sample_id_lookup) if sample_id_lookup is not None else None
+        )
 
         self._update_temporal_batch_size()
 
@@ -154,6 +158,79 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         if self.pairs is not None:
             self.temporal_chunk_size = len(self.pairs[0])
 
+    def _resolve_sample_ids(self, list_IDs_temp):
+        if isinstance(list_IDs_temp, (list, tuple, np.ndarray)):
+            raw_ids = list(list_IDs_temp)
+        else:
+            raw_ids = [list_IDs_temp]
+
+        sample_ids = []
+        for raw_id in raw_ids:
+            if (
+                self.sample_id_lookup is not None
+                and isinstance(raw_id, (int, np.integer))
+                and 0 <= int(raw_id) < len(self.sample_id_lookup)
+            ):
+                sample_ids.append(str(self.sample_id_lookup[int(raw_id)]))
+            else:
+                sample_ids.append(str(raw_id))
+
+        return sample_ids
+
+    def _extract_camera_targets(self, sample_ids, field):
+        if self.labels_2d is None:
+            return None
+
+        if field == "visibility":
+            has_visibility = any(
+                isinstance(self.labels_2d.get(sample_id), dict)
+                and "visibility" in self.labels_2d[sample_id]
+                for sample_id in sample_ids
+            )
+            if not has_visibility:
+                return None
+
+        reference_shapes = {}
+        for sample_id in sample_ids:
+            sample_entry = self.labels_2d.get(sample_id)
+            if not isinstance(sample_entry, dict):
+                continue
+            for cam_name, cam_data in sample_entry.get("data", {}).items():
+                cam_shape = np.asarray(cam_data).shape
+                if field == "data":
+                    reference_shapes.setdefault(cam_name, cam_shape)
+                else:
+                    reference_shapes.setdefault(cam_name, (cam_shape[-1],))
+
+        if len(reference_shapes) == 0:
+            return None
+
+        camera_targets = {cam_name: [] for cam_name in reference_shapes}
+        for sample_id in sample_ids:
+            sample_entry = self.labels_2d.get(sample_id)
+            sample_entry = sample_entry if isinstance(sample_entry, dict) else {}
+            field_map = sample_entry.get(field, {})
+            data_map = sample_entry.get("data", {})
+
+            for cam_name, ref_shape in reference_shapes.items():
+                if field == "data":
+                    cam_value = data_map.get(cam_name)
+                    if cam_value is None:
+                        cam_value = np.full(ref_shape, np.nan, dtype=np.float32)
+                    cam_value = np.asarray(cam_value, dtype=np.float32)
+                else:
+                    cam_value = field_map.get(cam_name) if isinstance(field_map, dict) else None
+                    if cam_value is None:
+                        cam_value = np.zeros(ref_shape, dtype=bool)
+                    cam_value = np.asarray(cam_value, dtype=bool)
+
+                camera_targets[cam_name].append(cam_value)
+
+        return {
+            cam_name: np.stack(cam_values, axis=0)
+            for cam_name, cam_values in camera_targets.items()
+        }
+
     def __getitem__(self, index):
         """Generate one batch of data.
 
@@ -172,33 +249,11 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         else:
             list_IDs_temp = [self.list_IDs[index]]
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
+        sample_ids_temp = self._resolve_sample_ids(list_IDs_temp)
+        y_2d = self._extract_camera_targets(sample_ids_temp, "data")
+        visibility_2d = self._extract_camera_targets(sample_ids_temp, "visibility")
 
-        # Extract 2D data for each camera and organize properly (quiet)
-        y_2d_cameras = {}
-        
-        try:
-            for ID in list_IDs_temp:
-                if ID not in self.labels_2d:
-                    continue
-                sample_2d_entry = self.labels_2d[ID]
-                if not isinstance(sample_2d_entry, dict) or "data" not in sample_2d_entry:
-                    continue
-                sample_2d_data = sample_2d_entry["data"]  # Get the camera data dict
-                for cam_name, cam_2d_data in sample_2d_data.items():
-                    if cam_name not in y_2d_cameras:
-                        y_2d_cameras[cam_name] = []
-                    y_2d_cameras[cam_name].append(cam_2d_data)
-            
-            # Stack data for each camera: (batch_size, 2, n_keypoints)
-            for cam_name in list(y_2d_cameras.keys()):
-                y_2d_cameras[cam_name] = np.stack(y_2d_cameras[cam_name], axis=0)
-            
-            y_2d = y_2d_cameras
-        except Exception:
-            y_2d = None
-        
-        # print(f"🔍 POSEDATASETFROMMEM GETITEM: Returning sample_ids: {list_IDs_temp}", flush=True)
-        return X, X_grid, y_3d, aux, y_2d
+        return X, X_grid, y_3d, aux, y_2d, sample_ids_temp, visibility_2d
 
     def rot90(self, X):
         """Rotate X by 90 degrees CCW.
@@ -483,9 +538,15 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         return np.stack(inds, axis=1)
 
     def _convert_numpy_to_tensor(self, X, X_grid, y_3d, aux):
+        # Mirror/flip augmentations can create numpy views with negative strides.
+        # torch.from_numpy does not support negative strides, so force contiguous arrays.
+        X = np.ascontiguousarray(X)
+        y_3d = np.ascontiguousarray(y_3d)
         if X_grid is not None:
+            X_grid = np.ascontiguousarray(X_grid)
             X_grid = torch.from_numpy(X_grid)
         if aux is not None:
+            aux = np.ascontiguousarray(aux)
             aux = torch.from_numpy(aux).permute(0, 4, 1, 2, 3)
 
         return (
@@ -682,36 +743,12 @@ class PoseDatasetNPY(PoseDatasetFromMem):
             list_IDs_temp = [self.list_IDs[index]]
         # Generate data
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
-        
-        # Extract 2D data for each camera and organize properly
-        y_2d_cameras = {}
-        
-        try:
-            for ID in list_IDs_temp:
-                if ID not in self.labels_2d:
-                    continue
-                    
-                sample_2d_entry = self.labels_2d[ID]
-                if not isinstance(sample_2d_entry, dict) or "data" not in sample_2d_entry:
-                    continue
-                    
-                sample_2d_data = sample_2d_entry["data"]  # Get the camera data dict
-                
-                for cam_name, cam_2d_data in sample_2d_data.items():
-                    if cam_name not in y_2d_cameras:
-                        y_2d_cameras[cam_name] = []
-                    y_2d_cameras[cam_name].append(cam_2d_data)
-            
-            # Stack data for each camera: (batch_size, 2, n_keypoints)
-            for cam_name in list(y_2d_cameras.keys()):
-                y_2d_cameras[cam_name] = np.stack(y_2d_cameras[cam_name], axis=0)
-            
-            y_2d = y_2d_cameras
-            
-        except Exception as e:
-            print(f"❌ [TRAINING] Exception extracting 2D data for samples {list_IDs_temp}: {e}", flush=True)
-            y_2d = None
-        return X, X_grid, y_3d, aux, y_2d, list_IDs_temp
+
+        sample_ids_temp = self._resolve_sample_ids(list_IDs_temp)
+        y_2d = self._extract_camera_targets(sample_ids_temp, "data")
+        visibility_2d = self._extract_camera_targets(sample_ids_temp, "visibility")
+
+        return X, X_grid, y_3d, aux, y_2d, sample_ids_temp, visibility_2d
 
     def _downscale_occluded_views(self, X, occlusion_scores):
         """

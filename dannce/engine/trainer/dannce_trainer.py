@@ -11,8 +11,12 @@ from dannce.engine.trainer.base_trainer import BaseTrainer
 from dannce.engine.trainer.train_utils import (
     LossHelper,
     MetricHelper,
+    build_visibility_camera_features,
+    get_visibility_camera_order,
     prepare_batch,
     save_2d_reprojection_visualizations,
+    visibility_dict_to_tensor,
+    visibility_tensor_to_dict,
 )
 from dannce.engine.utils.augmentation import construct_augmented_batch
 from dannce.engine.utils.image import norm_im
@@ -51,6 +55,20 @@ class DANNCETrainer(BaseTrainer):
         self.aug_batch = self.params.get("batch_augmentation", False)
         self.aug_bs = self.params.get("batch_aug_size", None)
         self.per_batch_sample = self.params["batch_size"]
+        self.learned_visibility_enabled = bool(
+            self.params.get("learned_visibility_enabled", False)
+        )
+        self.learned_visibility_bce_enabled = self.learned_visibility_enabled
+        self.learned_visibility_bce_stop_below = self.params.get(
+            "learned_visibility_stop_bce_below", None
+        )
+        self.learned_visibility_bce_stop_metric = str(
+            self.params.get("learned_visibility_stop_bce_metric", "val")
+        ).lower()
+        self.learned_visibility_bce_stop_after_epoch = int(
+            self.params.get("learned_visibility_stop_bce_after_epoch", 1)
+        )
+        self.learned_visibility_bce_stopped_epoch = None
 
         # set up csv file for tracking training and validation stats
         stats_file = open(
@@ -62,6 +80,129 @@ class DANNCETrainer(BaseTrainer):
         self.valid_stats_keys = ["val_" + k for k in self.stats_keys]
         stats_writer.writerow(["Epoch", *self.train_stats_keys, *self.valid_stats_keys])
         stats_file.close()
+
+    def _build_visibility_camera_features(
+        self,
+        sample_ids,
+        visibility_2d_gt,
+        cameras,
+        dtype,
+    ):
+        if not self.learned_visibility_enabled or visibility_2d_gt is None:
+            return None
+
+        camera_order = get_visibility_camera_order(visibility_2d_gt)
+        if len(camera_order) == 0:
+            return None
+
+        return build_visibility_camera_features(
+            sample_ids,
+            cameras,
+            camera_order,
+            device=self.device,
+            dtype=dtype,
+        )
+
+    def _predict_with_optional_visibility(
+        self,
+        volumes,
+        grid_centers,
+        visibility_camera_features=None,
+    ):
+        if self.learned_visibility_enabled:
+            keypoints_3d_pred, heatmaps, aux_outputs = self.model.predict_with_aux(
+                volumes,
+                grid_centers,
+                visibility_camera_features=visibility_camera_features,
+            )
+            return keypoints_3d_pred, heatmaps, aux_outputs.get("visibility_logits")
+
+        keypoints_3d_pred, heatmaps, _ = self.model(volumes, grid_centers)
+        return keypoints_3d_pred, heatmaps, None
+
+    def _compute_visibility_terms(self, epoch, visibility_2d_gt, visibility_logits):
+        if not self.learned_visibility_enabled:
+            return visibility_2d_gt, None, {}
+
+        zero_loss = torch.zeros((), device=self.device)
+        metric = {"VisibilityBCE": 0.0}
+
+        if visibility_2d_gt is None:
+            return visibility_2d_gt, zero_loss, metric
+
+        camera_order = get_visibility_camera_order(visibility_2d_gt)
+        if len(camera_order) == 0:
+            return visibility_2d_gt, zero_loss, metric
+
+        if visibility_logits is None:
+            raise RuntimeError(
+                "learned_visibility_enabled=True but the model did not return visibility logits."
+            )
+
+        effective_visibility = visibility_2d_gt
+        warmup_epochs = int(self.params.get("learned_visibility_warmup_epochs", 1))
+        mode = self.params.get("exclude_occluded_2d_mode", "capsule_raycast")
+        if mode == "learned" and epoch > warmup_epochs:
+            threshold = float(self.params.get("learned_visibility_threshold", 0.5))
+            predicted_visibility = torch.sigmoid(visibility_logits) >= threshold
+            effective_visibility = visibility_tensor_to_dict(
+                predicted_visibility, camera_order
+            )
+
+        if not self.learned_visibility_bce_enabled:
+            return effective_visibility, zero_loss, metric
+
+        target_tensor = visibility_dict_to_tensor(
+            visibility_2d_gt,
+            camera_order,
+            device=visibility_logits.device,
+            dtype=visibility_logits.dtype,
+        )
+        if target_tensor is None:
+            return effective_visibility, zero_loss, metric
+
+        if visibility_logits.shape != target_tensor.shape:
+            raise ValueError(
+                "Visibility logits shape mismatch: "
+                f"got {tuple(visibility_logits.shape)}, expected {tuple(target_tensor.shape)}."
+            )
+
+        visibility_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            visibility_logits, target_tensor
+        )
+        visibility_loss = visibility_loss * float(
+            self.params.get("learned_visibility_loss_weight", 1.0)
+        )
+        metric["VisibilityBCE"] = visibility_loss.detach().cpu().item()
+
+        return effective_visibility, visibility_loss, metric
+
+    def _maybe_disable_visibility_bce(self, epoch, train_stats, valid_stats):
+        if not self.learned_visibility_enabled or not self.learned_visibility_bce_enabled:
+            return
+
+        threshold = self.learned_visibility_bce_stop_below
+        if threshold is None or epoch < self.learned_visibility_bce_stop_after_epoch:
+            return
+
+        metric_source = (
+            valid_stats if self.learned_visibility_bce_stop_metric == "val" else train_stats
+        )
+        metric_prefix = (
+            "val" if self.learned_visibility_bce_stop_metric == "val" else "train"
+        )
+        current_bce = metric_source.get("VisibilityBCE")
+        if current_bce is None:
+            return
+
+        if float(current_bce) <= float(threshold):
+            self.learned_visibility_bce_enabled = False
+            self.learned_visibility_bce_stopped_epoch = epoch
+            self.logger.info(
+                "Disabling visibility BCE supervision after epoch "
+                f"{epoch}: {metric_prefix}_VisibilityBCE={float(current_bce):.4f} "
+                f"<= {float(threshold):.4f}."
+            )
 
     def train(self):
         for epoch in range(self.start_epoch, self.epochs + 1):
@@ -89,9 +230,24 @@ class DANNCETrainer(BaseTrainer):
             for k in self.stats_keys:
                 stats.append(valid_stats[k])
 
+            # Optional early-stopping condition on validation 3D MPJPE.
+            # This is useful for long runs that should stop once a target accuracy is reached.
+            stop_thr = self.params.get("stop_when_val_euclidean_distance_3D_below", None)
+            should_stop = False
+            if stop_thr is not None:
+                try:
+                    stop_thr = float(stop_thr)
+                    val_mpjpe = valid_stats.get("euclidean_distance_3D", None)
+                    if val_mpjpe is not None and float(val_mpjpe) <= stop_thr:
+                        should_stop = True
+                except Exception:
+                    # If parsing fails, ignore the stop request rather than crashing training.
+                    should_stop = False
+
             result_msg = result_msg + "".join(
                 f"val_{k}: {val:.4f}\n" for k, val in valid_stats.items()
             )
+            self._maybe_disable_visibility_bce(epoch, train_stats, valid_stats)
             self.logger.info(result_msg)
 
             # Update learning rate scheduler with validation loss
@@ -99,16 +255,25 @@ class DANNCETrainer(BaseTrainer):
                 # For ReduceLROnPlateau, use validation loss
                 scheduler_type = type(self.lr_scheduler).__name__
                 if scheduler_type == "ReduceLROnPlateau":
-                    # Use 2D validation loss if available, otherwise use main loss
-                    val_loss_2d_key = next((k for k in valid_stats.keys() if k.endswith('_2d')), None)
-                    if val_loss_2d_key:
-                        self.lr_scheduler.step(valid_stats[val_loss_2d_key])
-                        self.logger.info(f"LR Scheduler step with {val_loss_2d_key}: {valid_stats[val_loss_2d_key]:.4f}")
+                    # Allow explicit monitor override, otherwise prefer 3D metric for training decisions.
+                    monitor_key = self.params.get("lr_scheduler_monitor")
+                    if monitor_key in valid_stats:
+                        chosen_key = monitor_key
+                    elif "euclidean_distance_3D" in valid_stats:
+                        chosen_key = "euclidean_distance_3D"
                     else:
-                        # Fallback to first available loss
-                        val_loss = next(iter(valid_stats.values()))
-                        self.lr_scheduler.step(val_loss)
-                        self.logger.info(f"LR Scheduler step with validation loss: {val_loss:.4f}")
+                        # Backward-compatible fallback for runs without 3D metric logging.
+                        val_loss_2d_key = next(
+                            (k for k in valid_stats.keys() if k.endswith("_2d")),
+                            None,
+                        )
+                        chosen_key = val_loss_2d_key or next(iter(valid_stats.keys()))
+
+                    monitor_val = valid_stats[chosen_key]
+                    self.lr_scheduler.step(monitor_val)
+                    self.logger.info(
+                        f"LR Scheduler step with {chosen_key}: {monitor_val:.4f}"
+                    )
                 else:
                     # For other schedulers (StepLR, etc.), just step
                     self.lr_scheduler.step()
@@ -130,27 +295,81 @@ class DANNCETrainer(BaseTrainer):
             # save checkpoints after each save period or at the end of training
             self._save_checkpoint(epoch)
 
+            if should_stop:
+                self.logger.info(
+                    f"Early stopping at epoch {epoch}: val_euclidean_distance_3D <= {stop_thr}"
+                )
+                break
+
     def _forward(self, epoch, batch, train=True):
-        volumes, grid_centers, keypoints_3d_gt, aux, keypoints_2d_gt, batch_debug_info, sample_ids = prepare_batch(batch, self.device)
+        (
+            volumes,
+            grid_centers,
+            keypoints_3d_gt,
+            aux,
+            keypoints_2d_gt,
+            visibility_2d_gt,
+            batch_debug_info,
+            sample_ids,
+        ) = prepare_batch(batch, self.device)
 
         if self.visualize_batch:
             self.visualize(epoch, volumes)
             return
 
+        cameras = (
+            self.train_dataloader.dataset.cameras
+            if train
+            else self.valid_dataloader.dataset.cameras
+        )
+
         if train and self.aug_batch:
+            copies_per_sample = self.aug_bs // self.per_batch_sample
             volumes, grid_centers, aux = construct_augmented_batch(
                 volumes.permute(0, 2, 3, 4, 1),
                 grid_centers,
                 aux=aux if aux is None else aux.permute(0, 2, 3, 4, 1),
-                copies_per_sample=self.aug_bs // self.per_batch_sample,
+                copies_per_sample=copies_per_sample,
             )
             volumes = volumes.permute(0, 4, 1, 2, 3)
             aux = aux if aux is None else aux.permute(0, 4, 1, 2, 3)
             keypoints_3d_gt = keypoints_3d_gt.repeat(self.aug_bs, 1, 1)
+            if sample_ids is not None:
+                sample_ids = [
+                    sample_id
+                    for sample_id in sample_ids
+                    for _ in range(copies_per_sample)
+                ]
             if keypoints_2d_gt is not None:
-                keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
+                if isinstance(keypoints_2d_gt, dict):
+                    keypoints_2d_gt = {
+                        cam_name: cam_data.repeat(self.aug_bs, 1, 1)
+                        for cam_name, cam_data in keypoints_2d_gt.items()
+                    }
+                else:
+                    keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
+            if visibility_2d_gt is not None:
+                if isinstance(visibility_2d_gt, dict):
+                    visibility_2d_gt = {
+                        cam_name: cam_data.repeat(self.aug_bs, 1)
+                        for cam_name, cam_data in visibility_2d_gt.items()
+                    }
+                else:
+                    visibility_2d_gt = visibility_2d_gt.repeat(self.aug_bs, 1)
 
-        keypoints_3d_pred, heatmaps, _ = self.model(volumes, grid_centers)
+        visibility_camera_features = self._build_visibility_camera_features(
+            sample_ids,
+            visibility_2d_gt,
+            cameras,
+            volumes.dtype,
+        )
+        keypoints_3d_pred, heatmaps, visibility_logits = (
+            self._predict_with_optional_visibility(
+                volumes,
+                grid_centers,
+                visibility_camera_features=visibility_camera_features,
+            )
+        )
 
         keypoints_3d_gt, keypoints_3d_pred, heatmaps = self._split_data(
             keypoints_3d_gt, keypoints_3d_pred, heatmaps
@@ -163,7 +382,9 @@ class DANNCETrainer(BaseTrainer):
             grid_centers,
             aux,
             keypoints_2d_gt,
-            self.train_dataloader.dataset.cameras,
+            visibility_2d_gt,
+            visibility_logits,
+            cameras,
             sample_ids,
         )
 
@@ -186,9 +407,17 @@ class DANNCETrainer(BaseTrainer):
                 grid_centers,
                 aux,
                 keypoints_2d_gt,
+                visibility_2d_gt,
+                visibility_logits,
                 cameras,
                 sample_ids,
             ) = self._forward(epoch, batch)
+
+            visibility_mask, visibility_loss, visibility_metrics = (
+                self._compute_visibility_terms(
+                    epoch, visibility_2d_gt, visibility_logits
+                )
+            )
 
             total_loss, loss_dict = self.loss.compute_loss(
                 keypoints_3d_gt,
@@ -197,9 +426,13 @@ class DANNCETrainer(BaseTrainer):
                 grid_centers,
                 aux,
                 keypoints_2d_gt=keypoints_2d_gt,
+                visibility_2d_gt=visibility_mask,
                 cameras=cameras,
                 sample_ids=sample_ids,
             )
+            if visibility_loss is not None:
+                total_loss = total_loss + visibility_loss
+                loss_dict.update(visibility_metrics)
 
             # Optional concise grad print - disable by default to reduce noise
             # Build concise oneline status with 2D loss if present
@@ -230,9 +463,8 @@ class DANNCETrainer(BaseTrainer):
                     self.model.parameters(), 
                     clip_threshold
                 )
-                # Log if gradient was clipped (only for high values to avoid spam)
-                if grad_norm > clip_threshold * 2:
-                    print(f"   ⚡ Gradient norm clipped: {grad_norm:.2f} -> {clip_threshold}", flush=True)
+                # Intentionally avoid per-batch logging here; frequent stdout writes
+                # slow long runs with large numbers of training steps.
             
             self.optimizer.step()
 
@@ -308,9 +540,15 @@ class DANNCETrainer(BaseTrainer):
                     grid_centers,
                     aux,
                     keypoints_2d_gt,
+                    visibility_2d_gt,
+                    visibility_logits,
                     cameras,
                     sample_ids,
                 ) = self._forward(epoch, batch, False)
+
+                visibility_mask, _, visibility_metrics = self._compute_visibility_terms(
+                    epoch, visibility_2d_gt, visibility_logits
+                )
 
                 _, loss_dict = self.loss.compute_loss(
                     keypoints_3d_gt,
@@ -319,9 +557,11 @@ class DANNCETrainer(BaseTrainer):
                     grid_centers,
                     aux,
                     keypoints_2d_gt=keypoints_2d_gt,
+                    visibility_2d_gt=visibility_mask,
                     cameras=cameras,
                     sample_ids=sample_ids,
                 )
+                loss_dict.update(visibility_metrics)
                 epoch_loss_dict = self._update_step(epoch_loss_dict, loss_dict)
 
                 # Optionally visualize first 3 validation batches as well
@@ -385,7 +625,13 @@ class DANNCETrainer(BaseTrainer):
             for k, v in step_dict.items():
                 epoch_dict[k] = [v]
         else:
+            n_prev = len(next(iter(epoch_dict.values()))) if len(epoch_dict) > 0 else 0
+            for k in list(epoch_dict.keys()):
+                if k not in step_dict:
+                    epoch_dict[k].append(0.0)
             for k, v in step_dict.items():
+                if k not in epoch_dict:
+                    epoch_dict[k] = [0.0] * n_prev
                 epoch_dict[k].append(v)
         return epoch_dict
 

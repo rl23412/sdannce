@@ -211,6 +211,7 @@ def prepare_batch(batch, device):
     targets = batch[2].float().to(device)
     auxs = batch[3].to(device) if batch[3] is not None else None
     keypoints_2d_gt = batch[4] if batch[4] is not None else None
+    visibility_2d_gt = batch[6] if len(batch) > 6 and batch[6] is not None else None
     
     # Extract sample IDs for experiment-specific camera parameter matching
     sample_ids = None
@@ -230,7 +231,10 @@ def prepare_batch(batch, device):
             sample_ids = None
     
     # Build a one-line batch debug string but do not print/log by default
-    batch_debug_info = f"🔍 BATCH DEBUG: len={len(batch)}, 2D_labels=None:{batch[4] is None}, sample_ids={sample_ids[:3] if sample_ids else None}"
+    batch_debug_info = (
+        f"🔍 BATCH DEBUG: len={len(batch)}, 2D_labels=None:{batch[4] is None}, "
+        f"visibility=None:{visibility_2d_gt is None}, sample_ids={sample_ids[:3] if sample_ids else None}"
+    )
     
     # Convert camera-specific 2D data to device
     if keypoints_2d_gt is not None and isinstance(keypoints_2d_gt, dict):
@@ -241,8 +245,161 @@ def prepare_batch(batch, device):
             else:
                 keypoints_2d_gt_device[cam_name] = cam_data.float().to(device)
         keypoints_2d_gt = keypoints_2d_gt_device
+
+    if visibility_2d_gt is not None and isinstance(visibility_2d_gt, dict):
+        visibility_2d_gt_device = {}
+        for cam_name, cam_data in visibility_2d_gt.items():
+            if isinstance(cam_data, np.ndarray):
+                visibility_2d_gt_device[cam_name] = torch.from_numpy(cam_data).bool().to(device)
+            else:
+                visibility_2d_gt_device[cam_name] = cam_data.bool().to(device)
+        visibility_2d_gt = visibility_2d_gt_device
     
-    return volumes, grids, targets, auxs, keypoints_2d_gt, batch_debug_info, sample_ids
+    return (
+        volumes,
+        grids,
+        targets,
+        auxs,
+        keypoints_2d_gt,
+        visibility_2d_gt,
+        batch_debug_info,
+        sample_ids,
+    )
+
+
+def get_visibility_camera_order(visibility_2d):
+    if isinstance(visibility_2d, dict):
+        return list(visibility_2d.keys())
+    return []
+
+
+def flatten_camera_params(cameras):
+    if not isinstance(cameras, dict) or len(cameras) == 0:
+        return {}
+
+    sample_val = next(iter(cameras.values()))
+    if isinstance(sample_val, dict) and ("K" not in sample_val):
+        flattened = {}
+        for _exp_idx, cam_map in cameras.items():
+            if not isinstance(cam_map, dict):
+                continue
+            for cam_name, cam_params in cam_map.items():
+                flattened[cam_name] = cam_params
+        return flattened
+
+    return cameras
+
+
+def _extract_experiment_id(sample_id):
+    if isinstance(sample_id, str) and "_" in sample_id:
+        exp_id = sample_id.split("_", 1)[0]
+        if exp_id.isdigit():
+            return exp_id
+    return None
+
+
+def _resolve_camera_params(flat_cameras, sample_id, cam_name):
+    exp_id = _extract_experiment_id(sample_id)
+    if exp_id is not None:
+        exp_cam_name = f"{exp_id}_{cam_name}"
+        if exp_cam_name in flat_cameras:
+            return flat_cameras[exp_cam_name]
+
+    if cam_name in flat_cameras:
+        return flat_cameras[cam_name]
+
+    for candidate_name, cam_params in flat_cameras.items():
+        if candidate_name.endswith(f"_{cam_name}"):
+            return cam_params
+
+    return None
+
+
+def build_visibility_camera_features(
+    sample_ids,
+    cameras,
+    camera_order,
+    device=None,
+    dtype=torch.float32,
+):
+    if sample_ids is None or len(camera_order) == 0:
+        return None
+
+    flat_cameras = flatten_camera_params(cameras)
+    if len(flat_cameras) == 0:
+        return None
+
+    features = np.zeros((len(sample_ids), len(camera_order), 6), dtype=np.float32)
+    forward_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    for batch_idx, sample_id in enumerate(sample_ids):
+        for cam_idx, cam_name in enumerate(camera_order):
+            cam_params = _resolve_camera_params(flat_cameras, sample_id, cam_name)
+            if cam_params is None:
+                continue
+
+            rotation = np.asarray(
+                cam_params.get("R", cam_params.get("r")),
+                dtype=np.float32,
+            ).reshape(3, 3)
+            translation = np.asarray(cam_params["t"], dtype=np.float32).reshape(3)
+            camera_center = -(rotation.T @ translation)
+            camera_forward = rotation.T @ forward_axis
+            norm = np.linalg.norm(camera_forward)
+            if norm > 1e-6:
+                camera_forward = camera_forward / norm
+
+            features[batch_idx, cam_idx, :3] = camera_center
+            features[batch_idx, cam_idx, 3:] = camera_forward
+
+    return torch.as_tensor(features, device=device, dtype=dtype)
+
+
+def visibility_dict_to_tensor(
+    visibility_2d, camera_order, device=None, dtype=torch.float32
+):
+    if visibility_2d is None or len(camera_order) == 0:
+        return None
+
+    tensors = []
+    ref_shape = None
+    for cam_name in camera_order:
+        cam_data = visibility_2d.get(cam_name)
+        if cam_data is None:
+            if ref_shape is None:
+                raise ValueError(
+                    "Cannot infer visibility tensor shape before seeing a camera entry."
+                )
+            cam_tensor = torch.zeros(ref_shape, dtype=torch.bool, device=device)
+        else:
+            if isinstance(cam_data, np.ndarray):
+                cam_tensor = torch.from_numpy(cam_data)
+            else:
+                cam_tensor = cam_data
+            if device is not None:
+                cam_tensor = cam_tensor.to(device)
+            ref_shape = cam_tensor.shape
+
+        if cam_tensor.ndim == 1:
+            cam_tensor = cam_tensor.unsqueeze(0)
+
+        if dtype == torch.bool:
+            cam_tensor = cam_tensor.bool()
+        else:
+            cam_tensor = cam_tensor.to(dtype=dtype)
+
+        tensors.append(cam_tensor)
+
+    return torch.stack(tensors, dim=1)
+
+
+def visibility_tensor_to_dict(visibility_tensor, camera_order):
+    if visibility_tensor is None:
+        return None
+    return {
+        cam_name: visibility_tensor[:, cam_idx].bool()
+        for cam_idx, cam_name in enumerate(camera_order)
+    }
 
 
 def get_frame_id_from_sample(labels, sample_id, camera_name, exp_idx=None):
@@ -800,6 +957,7 @@ class LossHelper:
         aux=None,
         heatmaps_gt=None,
         keypoints_2d_gt=None,
+        visibility_2d_gt=None,
         cameras=None,
         sample_ids=None,  # Add sample_ids to determine experiment for each sample
         confidence_2d_gt=None,  # Add 2D confidence data for weighting
@@ -856,24 +1014,7 @@ class LossHelper:
             
             # Handle cameras dict: maintain experiment-specific parameters for accurate 2D reprojection
             # Do NOT merge cameras by base name - each experiment may have different calibrations!
-            flat_cameras = cameras
-            try:
-                # If nested by experiment index, flatten while keeping experiment prefixes
-                if isinstance(cameras, dict) and len(cameras) > 0:
-                    # Heuristic: nested if first value is a dict of camnames, not a camera param dict (missing 'K')
-                    sample_val = next(iter(cameras.values()))
-                    if isinstance(sample_val, dict) and ("K" not in sample_val):
-                        flattened = {}
-                        for exp_idx, cam_map in cameras.items():
-                            if not isinstance(cam_map, dict):
-                                continue
-                            for cam_name, cam_params in cam_map.items():
-                                # Keep the full experiment-prefixed camera name to preserve calibration uniqueness
-                                # This ensures Camera1 from Experiment 0 doesn't overwrite Camera1 from Experiment 1
-                                flattened[cam_name] = cam_params
-                        flat_cameras = flattened
-            except Exception:
-                flat_cameras = cameras
+            flat_cameras = flatten_camera_params(cameras)
 
             # Debug: inspect camera dict before projection
             # try:
@@ -1026,6 +1167,37 @@ class LossHelper:
                             # If GT has more samples, truncate to match prediction batch size
                             keypoints_2d_gt_cam = keypoints_2d_gt_cam[:pred_batch_size]
 
+                    if (
+                        self.loss_params.get("exclude_occluded_2d", False)
+                        and visibility_2d_gt is not None
+                        and cam_name in visibility_2d_gt
+                    ):
+                        visibility_2d_cam = visibility_2d_gt[cam_name]
+                        if not isinstance(visibility_2d_cam, torch.Tensor):
+                            visibility_2d_cam = torch.from_numpy(visibility_2d_cam).bool().to(kpts_pred.device)
+                        else:
+                            visibility_2d_cam = visibility_2d_cam.to(kpts_pred.device).bool()
+
+                        if visibility_2d_cam.shape[0] != pred_batch_size:
+                            if visibility_2d_cam.shape[0] < pred_batch_size:
+                                pad_size = pred_batch_size - visibility_2d_cam.shape[0]
+                                false_pad = torch.zeros(
+                                    (pad_size, visibility_2d_cam.shape[1]),
+                                    device=visibility_2d_cam.device,
+                                    dtype=torch.bool,
+                                )
+                                visibility_2d_cam = torch.cat([visibility_2d_cam, false_pad], dim=0)
+                            else:
+                                visibility_2d_cam = visibility_2d_cam[:pred_batch_size]
+
+                        invisible_mask = (~visibility_2d_cam).unsqueeze(1).expand_as(
+                            keypoints_2d_gt_cam
+                        )
+                        keypoints_2d_gt_cam = keypoints_2d_gt_cam.clone()
+                        keypoints_2d_gt_cam = keypoints_2d_gt_cam.masked_fill(
+                            invisible_mask, float("nan")
+                        )
+
                     # Skip cameras with no valid GT points
                     valid_gt_mask = ~torch.isnan(keypoints_2d_gt_cam)
                     n_valid_gt = valid_gt_mask.sum().item()
@@ -1134,6 +1306,10 @@ class LossHelper:
                     total_loss.append(avg_2d_loss)
                     loss_dict[f"{loss_name}_2d"] = avg_2d_loss.detach().clone().cpu().item()
 
+        if len(total_loss) == 0:
+            # A fully masked 2D-only batch should no-op instead of crashing backward().
+            return kpts_pred.sum() * 0.0, loss_dict
+
         return sum(total_loss), loss_dict
 
     @property
@@ -1141,6 +1317,8 @@ class LossHelper:
         # Include both 3D and 2D loss names for CSV logging
         names = list(self.loss_fcns_3d.keys())
         names.extend([f"{name}_2d" for name in self.loss_fcns_2d.keys()])
+        if self.loss_params.get("learned_visibility_enabled", False):
+            names.append("VisibilityBCE")
         return names
 
 

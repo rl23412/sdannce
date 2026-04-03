@@ -30,7 +30,16 @@ class SDANNCETrainer(DANNCETrainer):
             self.loss.loss_fcns.pop("L1Loss")
 
     def _forward(self, epoch, batch, train=True):
-        volumes, grid_centers, keypoints_3d_gt, aux, keypoints_2d_gt, batch_debug_info, sample_ids = prepare_batch(batch, self.device)
+        (
+            volumes,
+            grid_centers,
+            keypoints_3d_gt,
+            aux,
+            keypoints_2d_gt,
+            visibility_2d_gt,
+            batch_debug_info,
+            sample_ids,
+        ) = prepare_batch(batch, self.device)
         
         # Extract confidence data if available
         confidence_2d_gt = None
@@ -46,11 +55,12 @@ class SDANNCETrainer(DANNCETrainer):
 
         # form training batch with augmented samples
         if train and self.aug_batch:
+            copies_per_sample = self.aug_bs // self.per_batch_sample
             volumes, grid_centers, aux = construct_augmented_batch(
                 volumes.permute(0, 2, 3, 4, 1),
                 grid_centers,
                 aux=aux if aux is None else aux.permute(0, 2, 3, 4, 1),
-                copies_per_sample=self.aug_bs // self.per_batch_sample,
+                copies_per_sample=copies_per_sample,
             )
             volumes = volumes.permute(0, 4, 1, 2, 3)
             aux = aux if aux is None else aux.permute(0, 4, 1, 2, 3)
@@ -61,10 +71,30 @@ class SDANNCETrainer(DANNCETrainer):
                 .transpose(1, 0)
                 .flatten(0, 1)
             )
+            if sample_ids is not None:
+                sample_ids = [
+                    sample_id
+                    for sample_id in sample_ids
+                    for _ in range(copies_per_sample)
+                ]
             
             # Handle 2D augmentation for social DANNCE
             if keypoints_2d_gt is not None:
-                keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
+                if isinstance(keypoints_2d_gt, dict):
+                    keypoints_2d_gt = {
+                        cam_name: cam_data.repeat(self.aug_bs, 1, 1)
+                        for cam_name, cam_data in keypoints_2d_gt.items()
+                    }
+                else:
+                    keypoints_2d_gt = keypoints_2d_gt.repeat(self.aug_bs, 1, 1)
+            if visibility_2d_gt is not None:
+                if isinstance(visibility_2d_gt, dict):
+                    visibility_2d_gt = {
+                        cam_name: cam_data.repeat(self.aug_bs, 1)
+                        for cam_name, cam_data in visibility_2d_gt.items()
+                    }
+                else:
+                    visibility_2d_gt = visibility_2d_gt.repeat(self.aug_bs, 1)
             if confidence_2d_gt is not None:
                 # Assuming confidence_2d_gt follows similar structure to keypoints_2d_gt
                 if isinstance(confidence_2d_gt, dict):
@@ -72,8 +102,31 @@ class SDANNCETrainer(DANNCETrainer):
                 else:
                     confidence_2d_gt = confidence_2d_gt.repeat(self.aug_bs, 1, 1)
 
+        cameras = (
+            self.train_dataloader.dataset.cameras
+            if train
+            else self.valid_dataloader.dataset.cameras
+        )
+        visibility_camera_features = self._build_visibility_camera_features(
+            sample_ids,
+            visibility_2d_gt,
+            cameras,
+            volumes.dtype,
+        )
+
         # initial pose generation
-        init_poses, keypoints_3d_pred, heatmaps = self.model(volumes, grid_centers)
+        if self.learned_visibility_enabled:
+            init_poses, keypoints_3d_pred, heatmaps, aux_outputs = (
+                self.model.predict_with_aux(
+                    volumes,
+                    grid_centers,
+                    visibility_camera_features=visibility_camera_features,
+                )
+            )
+            visibility_logits = aux_outputs.get("visibility_logits")
+        else:
+            init_poses, keypoints_3d_pred, heatmaps = self.model(volumes, grid_centers)
+            visibility_logits = None
 
         if not isinstance(keypoints_3d_pred, list):
             keypoints_3d_gt, keypoints_3d_pred, heatmaps = self._split_data(
@@ -88,7 +141,9 @@ class SDANNCETrainer(DANNCETrainer):
             grid_centers,
             aux,
             keypoints_2d_gt,
-            self.train_dataloader.dataset.cameras if hasattr(self.train_dataloader.dataset, 'cameras') else None,
+            visibility_2d_gt,
+            visibility_logits,
+            cameras,
             sample_ids,
             confidence_2d_gt,
         )
@@ -102,6 +157,7 @@ class SDANNCETrainer(DANNCETrainer):
         grid_centers,
         aux,
         keypoints_2d_gt=None,
+        visibility_2d_gt=None,
         cameras=None,
         sample_ids=None,
         confidence_2d_gt=None,
@@ -117,6 +173,7 @@ class SDANNCETrainer(DANNCETrainer):
                 grid_centers,
                 aux,
                 keypoints_2d_gt=keypoints_2d_gt,
+                visibility_2d_gt=visibility_2d_gt,
                 cameras=cameras,
                 sample_ids=sample_ids,
                 confidence_2d_gt=confidence_2d_gt,
@@ -138,6 +195,7 @@ class SDANNCETrainer(DANNCETrainer):
                 total_loss, loss_dict = self.loss.compute_loss(
                     keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux,
                     keypoints_2d_gt=keypoints_2d_gt,
+                    visibility_2d_gt=visibility_2d_gt,
                     cameras=cameras,
                     sample_ids=sample_ids,
                     confidence_2d_gt=confidence_2d_gt,
@@ -162,6 +220,7 @@ class SDANNCETrainer(DANNCETrainer):
                     grid_centers,
                     aux,
                     keypoints_2d_gt=keypoints_2d_gt,
+                    visibility_2d_gt=visibility_2d_gt,
                     cameras=cameras,
                     sample_ids=sample_ids,
                     confidence_2d_gt=confidence_2d_gt,
@@ -174,6 +233,7 @@ class SDANNCETrainer(DANNCETrainer):
             total_loss, loss_dict = self.loss.compute_loss(
                 keypoints_3d_gt, keypoints_3d_pred, heatmaps, grid_centers, aux,
                 keypoints_2d_gt=keypoints_2d_gt,
+                visibility_2d_gt=visibility_2d_gt,
                 cameras=cameras,
                 sample_ids=sample_ids,
                 confidence_2d_gt=confidence_2d_gt,
@@ -212,10 +272,18 @@ class SDANNCETrainer(DANNCETrainer):
                 grid_centers,
                 aux,
                 keypoints_2d_gt,
+                visibility_2d_gt,
+                visibility_logits,
                 cameras,
                 sample_ids,
                 confidence_2d_gt,
             ) = self._forward(epoch, batch)
+
+            visibility_mask, visibility_loss, visibility_metrics = (
+                self._compute_visibility_terms(
+                    epoch, visibility_2d_gt, visibility_logits
+                )
+            )
 
             (
                 total_loss,
@@ -231,10 +299,14 @@ class SDANNCETrainer(DANNCETrainer):
                 grid_centers,
                 aux,
                 keypoints_2d_gt,
+                visibility_mask,
                 cameras,
                 sample_ids,
                 confidence_2d_gt,
             )
+            if visibility_loss is not None:
+                total_loss = total_loss + visibility_loss
+                loss_dict.update(visibility_metrics)
 
             result = f"Epoch[{epoch}/{self.epochs}] " + "".join(
                 f"train_{loss}: {val:.4f} " for loss, val in loss_dict.items()
@@ -283,10 +355,18 @@ class SDANNCETrainer(DANNCETrainer):
                     grid_centers,
                     aux,
                     keypoints_2d_gt,
+                    visibility_2d_gt,
+                    visibility_logits,
                     cameras,
                     sample_ids,
                     confidence_2d_gt,
                 ) = self._forward(epoch, batch, False)
+
+                visibility_mask, _, visibility_metrics = (
+                    self._compute_visibility_terms(
+                        epoch, visibility_2d_gt, visibility_logits
+                    )
+                )
 
                 (
                     total_loss,
@@ -302,10 +382,12 @@ class SDANNCETrainer(DANNCETrainer):
                     grid_centers,
                     aux,
                     keypoints_2d_gt,
+                    visibility_mask,
                     cameras,
                     sample_ids,
                     confidence_2d_gt,
                 )
+                loss_dict.update(visibility_metrics)
 
                 epoch_loss_dict = self._update_step(epoch_loss_dict, loss_dict)
 

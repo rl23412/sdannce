@@ -1,7 +1,7 @@
 """Define routines for reading/structuring input data for DANNCE."""
 import os
 import pickle
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 import warnings
 
 import numpy as np
@@ -152,14 +152,25 @@ def prepare_data(
             np.reshape(data_3d, [data_3d.shape[0], -1, 3]), [0, 2, 1]
         )
 
-    # If specific markers are set to be excluded, set them to NaN here.
+    # If specific markers are set to be excluded, set them to NaN in both 3D
+    # labels and per-camera 2D targets so they do not contribute to either loss.
     if params["drop_landmark"] is not None and (stage != "predict"):
         logger.info(
-            "Setting landmarks {} to NaN. These landmarks will not be included in loss or metric evaluations".format(
+            "Setting landmarks {} to NaN in 3D and matching 2D targets. "
+            "These landmarks will not be included in loss or metric evaluations".format(
                 params["drop_landmark"]
             )
         )
-        data_3d[:, :, params["drop_landmark"]] = np.nan
+        drop_landmarks = sorted({int(idx) for idx in params["drop_landmark"]})
+        valid_3d_drop = [idx for idx in drop_landmarks if idx < data_3d.shape[2]]
+        if len(valid_3d_drop) > 0:
+            data_3d[:, :, valid_3d_drop] = np.nan
+        for cam_name, cam_data in ddict.items():
+            if cam_data.ndim != 3 or cam_data.shape[2] != data_3d.shape[2]:
+                continue
+            valid_2d_drop = [idx for idx in drop_landmarks if idx < cam_data.shape[2]]
+            if len(valid_2d_drop) > 0:
+                cam_data[:, :, valid_2d_drop] = np.nan
 
     valid_sample_length = min(
         len(samples),
@@ -232,6 +243,43 @@ def get_chunks(
     return all_samples_inds
 
 
+def _temporal_anchor_budget(params: Dict, valid: bool) -> Optional[int]:
+    """Return the desired number of labeled anchor samples before chunk expansion."""
+    if valid:
+        budget = params.get("num_validation_per_exp")
+    else:
+        budget = params.get("num_train_per_exp")
+        valid_budget = params.get("num_validation_per_exp")
+        if budget not in (None, "max") and valid_budget not in (None, "max"):
+            budget = int(budget) + int(valid_budget)
+
+    if budget in (None, "max"):
+        return None
+    return int(budget)
+
+
+def _subsample_temporal_anchor_samples(params: Dict, samples, valid: bool):
+    """Subsample labeled temporal anchors before neighborhood chunk expansion."""
+    budget = _temporal_anchor_budget(params, valid)
+    samples = np.asarray(samples)
+    if budget is None or budget >= len(samples):
+        return samples
+
+    seed = params.get("data_split_seed")
+    rng = np.random.default_rng(seed)
+    keep_idx = np.sort(rng.choice(len(samples), size=budget, replace=False))
+    selected = samples[keep_idx]
+    logger.info(
+        "Temporal anchor prefilter selected {} / {} labeled samples for {} stage "
+        "before chunk expansion.".format(
+            len(selected),
+            len(samples),
+            "validation" if valid else "training",
+        )
+    )
+    return selected
+
+
 def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
     """
     For temporal training, prepare samples in form of consecutive chunks.
@@ -266,6 +314,7 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
         )
         samples = None
     else:
+        samples = _subsample_temporal_anchor_samples(params, samples, valid)
         # locate labeled frames
         sample_inds = [np.where(samples_extra == samp)[0][0] for samp in samples]
 
@@ -633,19 +682,36 @@ def remove_samples_com(s, com3d_dict, cthresh=350, rmc=False):
     (i.e. no camera pair above threshold for a given frame)
     Also, let's remove any sample where abs(COM) is > 350
     """
+    s = np.asarray(s)
     sample_mask = np.ones((len(s),), dtype="bool")
+    dropped_missing = 0
+    dropped_nonfinite = 0
+    dropped_thresh = 0
 
     for i in range(len(s)):
         if s[i] not in com3d_dict:
             sample_mask[i] = 0
+            dropped_missing += 1
         else:
-            if np.isnan(np.sum(com3d_dict[s[i]])):
+            com = np.asarray(com3d_dict[s[i]], dtype=float)
+            if not np.all(np.isfinite(com)):
                 sample_mask[i] = 0
-            if rmc:
-                if np.any(np.abs(com3d_dict[s[i]]) > cthresh):
-                    sample_mask[i] = 0
+                dropped_nonfinite += 1
+            elif rmc and np.any(np.abs(com) > cthresh):
+                sample_mask[i] = 0
+                dropped_thresh += 1
 
     s = s[sample_mask]
+    if dropped_missing or dropped_nonfinite or dropped_thresh:
+        logger.info(
+            "Removed {} samples due to invalid COMs (missing={}, nonfinite={}, "
+            "outside_cthresh={}).".format(
+                dropped_missing + dropped_nonfinite + dropped_thresh,
+                dropped_missing,
+                dropped_nonfinite,
+                dropped_thresh,
+            )
+        )
     return s
 
 
@@ -781,8 +847,53 @@ def collate_fn(items):
     except:
         auxs = None
 
-    # 2D labels can be a dict of cameras -> numpy arrays/tensors
+    def _base_camera_name(cam_name):
+        if "_" in cam_name and cam_name.split("_")[0].isdigit():
+            return "_".join(cam_name.split("_")[1:])
+        return cam_name
+
+    def _collate_camera_dict(field_index, fill_factory):
+        camera_groups = {}
+        batch_size = len(items)
+
+        for item_idx, item in enumerate(items):
+            if len(item) <= field_index or not isinstance(item[field_index], dict):
+                continue
+
+            for cam_name, cam_data in item[field_index].items():
+                base_cam = _base_camera_name(cam_name)
+                if base_cam not in camera_groups:
+                    camera_groups[base_cam] = {}
+
+                if torch.is_tensor(cam_data):
+                    cam_data = cam_data.detach().cpu().numpy()
+
+                camera_groups[base_cam][item_idx] = np.asarray(cam_data)
+
+        collated = {}
+        for base_cam, item_data in camera_groups.items():
+            ref_shape = None
+            for item_idx in range(batch_size):
+                if item_idx in item_data:
+                    ref_shape = item_data[item_idx].shape
+                    break
+
+            if ref_shape is None:
+                continue
+
+            batches = []
+            for item_idx in range(batch_size):
+                if item_idx in item_data:
+                    batches.append(item_data[item_idx])
+                else:
+                    batches.append(fill_factory(ref_shape))
+
+            collated[base_cam] = np.concatenate(batches, axis=0)
+
+        return collated or None
+
     labels_2d = None
+    visibility_2d = None
     # Track sample IDs per batch row (optional). This preserves alignment with volumes
     sample_ids_batch = None
     try:
@@ -799,73 +910,24 @@ def collate_fn(items):
             sample_ids_batch = collected
     except Exception:
         sample_ids_batch = None
-    
-    if len(items[0]) > 4:
-        sample_l2d = items[0][4]
-        
-        if isinstance(sample_l2d, dict):
-            # Group cameras by their base name (strip experiment prefix)
-            # e.g., "0_Camera1" and "1_Camera1" both map to "Camera1"
-            camera_groups = {}
-            batch_size = len(items)
-            
-            # First pass: identify all unique base camera names
-            for item_idx, it in enumerate(items):
-                l2d = it[4]
-                if isinstance(l2d, dict):
-                    for cam_name, cam_data in l2d.items():
-                        # More robust experiment prefix detection
-                        if '_' in cam_name and cam_name.split('_')[0].isdigit():
-                            # Extract base camera name (remove experiment prefix)
-                            base_cam = '_'.join(cam_name.split('_')[1:])
-                        else:
-                            base_cam = cam_name
-                        
-                        if base_cam not in camera_groups:
-                            camera_groups[base_cam] = {}
-                        
-                        if torch.is_tensor(cam_data):
-                            cam_data = cam_data.detach().cpu().numpy()
-                        
-                        camera_groups[base_cam][item_idx] = cam_data
 
-            # Second pass: create batch tensors for each base camera
-            labels_2d = {}
-            for base_cam, item_data in camera_groups.items():
-                # Get reference shape from first available sample
-                ref_shape = None
-                for item_idx in range(batch_size):
-                    if item_idx in item_data:
-                        ref_shape = item_data[item_idx].shape  # expected: (1, 2, n_keypoints)
-                        break
-                
-                if ref_shape is None:
-                    continue
-                
-                # Build batch tensor with NaN padding for missing samples
-                cam_batches = []
-                for item_idx in range(batch_size):
-                    if item_idx in item_data:
-                        cam_batches.append(item_data[item_idx])
-                    else:
-                        # Pad with NaN for missing camera in this sample
-                        cam_batches.append(np.full(ref_shape, np.nan, dtype=np.float32))
-                
-                # Concatenate along batch dimension
-                labels_2d[base_cam] = np.concatenate(cam_batches, axis=0)
-                
-            # If nothing was gathered, keep None to signal absence
-            if len(labels_2d) == 0:
-                labels_2d = None
-                
+    if any(len(item) > 4 and item[4] is not None for item in items):
+        if any(isinstance(item[4], dict) for item in items if len(item) > 4):
+            labels_2d = _collate_camera_dict(
+                4, lambda shape: np.full(shape, np.nan, dtype=np.float32)
+            )
         else:
-            # If it's already a tensor/array, try to cat directly
             try:
                 labels_2d = torch.cat([item[4] for item in items], dim=0)
             except Exception:
                 labels_2d = None
 
-    return volumes, grids, targets, auxs, labels_2d, sample_ids_batch
+    if any(len(item) > 6 and item[6] is not None for item in items):
+        visibility_2d = _collate_camera_dict(
+            6, lambda shape: np.zeros(shape, dtype=bool)
+        )
+
+    return volumes, grids, targets, auxs, labels_2d, sample_ids_batch, visibility_2d
 
 
 def setup_dataloaders(train_dataset, valid_dataset, params):
