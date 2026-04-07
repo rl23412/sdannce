@@ -33,9 +33,7 @@ def compute_mask_nan_loss(loss_fcn, kpts_gt, kpts_pred):
     valid_gt = kpts_gt[notnan_gt]
     valid_pred = kpts_pred[notnan_gt]
     
-    # Compute loss using mean reduction for better gradient flow
-    loss = torch.nn.functional.l1_loss(valid_pred, valid_gt, reduction='mean')
-    return loss
+    return loss_fcn(valid_gt, valid_pred)
 
 
 ##################################################################################################
