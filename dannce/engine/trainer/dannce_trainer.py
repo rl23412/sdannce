@@ -333,7 +333,9 @@ class DANNCETrainer(BaseTrainer):
             )
             volumes = volumes.permute(0, 4, 1, 2, 3)
             aux = aux if aux is None else aux.permute(0, 4, 1, 2, 3)
-            keypoints_3d_gt = keypoints_3d_gt.repeat(self.aug_bs, 1, 1)
+            keypoints_3d_gt = keypoints_3d_gt.repeat_interleave(
+                copies_per_sample, dim=0
+            )
             if sample_ids is not None:
                 sample_ids = [
                     sample_id

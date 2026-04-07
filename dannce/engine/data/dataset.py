@@ -347,16 +347,33 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         """
         # torchvision.transforms.functional.affine - input: [..., H, W]
         rotangle = np.random.rand() * (2 * max_delta) - max_delta
-        X = (
-            torch.from_numpy(X).reshape(*X.shape[:3], -1).permute(0, 3, 1, 2)
-        )  # dimension [B, D*C, H, W]
-        y_3d = torch.from_numpy(y_3d).reshape(y_3d.shape[:3], -1).permute(0, 3, 1, 2)
-        for i in range(X.shape[0]):
-            X[i] = TF.affine(X[i], angle=rotangle)
-            y_3d[i] = TF.affine(y_3d[i], angle=rotangle)
+        X_shape = X.shape
+        y_3d_shape = y_3d.shape
 
-        X = X.permute(0, 2, 3, 1).reshape(*X.shape[:3], X.shape[2], -1).numpy()
-        y_3d = y_3d.permute(0, 2, 3, 1).reshape(*X.shape[:3], X.shape[2], -1).numpy()
+        X = torch.from_numpy(X).reshape(*X_shape[:3], -1).permute(
+            0, 3, 1, 2
+        )  # dimension [B, D*C, H, W]
+        y_3d = torch.from_numpy(y_3d).reshape(*y_3d_shape[:3], -1).permute(0, 3, 1, 2)
+        for i in range(X.shape[0]):
+            X[i] = TF.affine(
+                X[i],
+                angle=rotangle,
+                translate=[0, 0],
+                scale=1.0,
+                shear=[0.0, 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            y_3d[i] = TF.affine(
+                y_3d[i],
+                angle=rotangle,
+                translate=[0, 0],
+                scale=1.0,
+                shear=[0.0, 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+
+        X = X.permute(0, 2, 3, 1).reshape(*X_shape).numpy()
+        y_3d = y_3d.permute(0, 2, 3, 1).reshape(*y_3d_shape).numpy()
 
         return X, y_3d
 
@@ -982,6 +999,21 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         self.shear_val = shear_val
         self.zoom_val = zoom_val
 
+        self.list_IDs = self._group_list_ids(self.list_IDs)
+
+    def _group_list_ids(self, list_IDs):
+        if len(list_IDs) == 0:
+            return []
+
+        first_item = list_IDs[0]
+        if np.isscalar(first_item):
+            return [
+                np.asarray(list_IDs[i : i + self.batch_size])
+                for i in range(0, len(list_IDs), self.batch_size)
+            ]
+
+        return [np.asarray(ids) for ids in list_IDs]
+
     def __len__(self):
         return len(self.list_IDs)
 
@@ -1024,7 +1056,7 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         return X, y_2d
 
     def __getitem__(self, index):
-        list_IDs_temp = [self.list_IDs[index]]
+        list_IDs_temp = self.list_IDs[index]
         X, y = self.__data_generation(list_IDs_temp)
 
         return X, y
@@ -1033,8 +1065,9 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         """Generate data containing batch_size samples."""
         # Initialization
 
-        X = np.zeros((self.batch_size, *self.data.shape[1:]))
-        y_2d = np.zeros((self.batch_size, *self.labels.shape[1:]))
+        n_ids = len(list_IDs_temp)
+        X = np.zeros((n_ids, *self.data.shape[1:]), dtype=self.data.dtype)
+        y_2d = np.zeros((n_ids, *self.labels.shape[1:]), dtype=self.labels.dtype)
 
         for i, ID in enumerate(list_IDs_temp):
             X[i] = self.data[ID].copy()
@@ -1056,20 +1089,36 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
             # TODO: replace with torchvision.transforms
             if self.augment_rotation:
                 affine["rotation"] = self.rotation_val * (np.random.rand() * 2 - 1)
-            # if self.augment_zoom:
-            #     affine["zoom"] = self.zoom_val * (np.random.rand() * 2 - 1) + 1
+            if self.augment_zoom:
+                affine["zoom"] = self.zoom_val * (np.random.rand() * 2 - 1) + 1
             if self.augment_shear:
                 affine["shear"] = self.shear_val * (np.random.rand() * 2 - 1)
 
+            X = torch.from_numpy(X).permute(0, 3, 1, 2).float()
+            y_2d = torch.from_numpy(y_2d).permute(0, 3, 1, 2).float()
+
             X = TF.affine(
-                torch.from_numpy(X).permute(0, 3, 1, 2),
+                X,
                 angle=affine["rotation"],
-                shear=affine["shear"],
+                translate=[0, 0],
+                scale=affine["zoom"],
+                shear=[affine["shear"], 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
             )
             y_2d = TF.affine(
-                torch.from_numpy(y_2d).permute(0, 3, 1, 2),
+                y_2d,
                 angle=affine["rotation"],
-                shear=affine["shear"],
+                translate=[0, 0],
+                scale=affine["zoom"],
+                shear=[affine["shear"], 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+
+            X = X.permute(0, 2, 3, 1).numpy().astype(self.data.dtype, copy=False)
+            y_2d = (
+                y_2d.permute(0, 2, 3, 1)
+                .numpy()
+                .astype(self.labels.dtype, copy=False)
             )
 
         if self.augment_shift:

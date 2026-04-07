@@ -577,7 +577,8 @@ def make_data_splits(
 
                 new_train_chunks = []
                 for chunk in train_chunks:
-                    if chunk[2] not in train_samples_to_be_removed:
+                    chunk_center = chunk[len(chunk) // 2]
+                    if chunk_center not in train_samples_to_be_removed:
                         new_train_chunks.append(chunk)
                 train_chunks = new_train_chunks
 

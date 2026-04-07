@@ -256,6 +256,7 @@ class COMAugmentation:
     augment_rotation: bool = False
     augment_shear: bool = False
     augment_zoom: bool = False
+    augment_shift: bool = False
     augment_shear_val: int = 5
     augment_zoom_val: float = 0.05
     augment_shift_val: float = 0.05

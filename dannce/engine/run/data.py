@@ -1189,6 +1189,8 @@ def make_dataset_inference(params, valid_params):
         vids = {}
         for e in range(num_experiments):
             vids = processing.initialize_vids(params, datadict, e, vids, pathonly=True)
+    else:
+        vids = {}
 
     # Parameters
     valid_params = {
@@ -1244,9 +1246,11 @@ def make_dataset_inference(params, valid_params):
         params["write_visual_hull"] is not None
     ):
         # require silhouette + RGB volume
-        vids_sil = processing.initialize_vids(
-            params, datadict, 0, {}, pathonly=True, vidkey="viddir_sil"
-        )
+        vids_sil = {}
+        for e in range(num_experiments):
+            vids_sil = processing.initialize_vids(
+                params, datadict, e, vids_sil, pathonly=True, vidkey="viddir_sil"
+            )
         valid_params_sil = deepcopy(valid_params)
         valid_params_sil["vidreaders"] = vids_sil
         valid_params_sil["norm_im"] = False

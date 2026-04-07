@@ -66,10 +66,8 @@ class SDANNCETrainer(DANNCETrainer):
             aux = aux if aux is None else aux.permute(0, 4, 1, 2, 3)
 
             # update ground truth
-            keypoints_3d_gt = (
-                keypoints_3d_gt.repeat(self.aug_bs // self.per_batch_sample, 1, 1, 1)
-                .transpose(1, 0)
-                .flatten(0, 1)
+            keypoints_3d_gt = keypoints_3d_gt.repeat_interleave(
+                copies_per_sample, dim=0
             )
             if sample_ids is not None:
                 sample_ids = [
