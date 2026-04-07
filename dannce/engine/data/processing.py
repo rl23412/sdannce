@@ -260,6 +260,8 @@ def load_all_com_exps(params: Dict, exps: List):
     camnames = {}
     datadict = {}
     datadict_3d = {}
+    com3d_dict = {}
+    temporal_chunks = {}
     samples = []
     for e, expdict in enumerate(exps):
 
@@ -298,7 +300,16 @@ def load_all_com_exps(params: Dict, exps: List):
 
     samples = np.array(samples)
 
-    return samples, datadict, datadict_3d, com3d_dict, cameras, camnames, total_chunks, temporal_chunks
+    return (
+        samples,
+        datadict,
+        datadict_3d,
+        com3d_dict,
+        cameras,
+        camnames,
+        total_chunks,
+        temporal_chunks,
+    )
 
 
 def do_COM_load(exp: Dict, expdict: Dict, e, params: Dict, training=True):
@@ -566,7 +577,8 @@ def make_data_splits(
 
                 new_train_chunks = []
                 for chunk in train_chunks:
-                    if chunk[2] not in train_samples_to_be_removed:
+                    chunk_center = chunk[len(chunk) // 2]
+                    if chunk_center not in train_samples_to_be_removed:
                         new_train_chunks.append(chunk)
                 train_chunks = new_train_chunks
 

@@ -239,6 +239,9 @@ def get_chunks(
 
         chunk_ind_list.append(chunk)
 
+    if len(chunk_ind_list) == 0:
+        return np.array([], dtype=int)
+
     all_samples_inds = np.concatenate(chunk_ind_list).astype(int)
     return all_samples_inds
 
@@ -297,19 +300,42 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
     # select extra samples from the neighborhood of labeled samples
     # each of which is referred as a "temporal chunk"
     left_bound, right_bound = get_seq_bounds(temp_n)
+    downsample = params.get("downsample", 1)
+
+    def _clip_request_size(requested, available, context):
+        if requested is None:
+            return 0
+        requested = int(requested)
+        if requested <= 0 or available <= 0:
+            return 0
+        clipped = min(requested, available)
+        if clipped < requested:
+            logger.warning(
+                "Requested {} temporal chunks for {}, but only {} are available. "
+                "Clipping request.".format(requested, context, clipped)
+            )
+        return clipped
+
+    valid_support_inds = np.arange(
+        max(0, -left_bound * downsample),
+        max(0, len(samples_extra) - max(0, (right_bound - 1) * downsample)),
+        max(1, temp_n * downsample),
+    )
 
     # what if we want to use the unlabeled frames in the test set for pretraining
     sample_inds, samples_inds_unlabeled, samples_test_inds = [], [], []
     if (support) and isinstance(params["n_support_chunks"], int):
-        samples_test_inds = np.random.choice(
-            samples_extra[-left_bound::temp_n],
-            size=params["n_support_chunks"],
-            replace=False,
+        n_support_chunks = _clip_request_size(
+            params["n_support_chunks"], len(valid_support_inds), "support pretraining"
         )
-        samples_test_inds = sorted(list(samples_test_inds))
+        if n_support_chunks > 0:
+            samples_test_inds = np.random.choice(
+                valid_support_inds, size=n_support_chunks, replace=False,
+            )
+            samples_test_inds = sorted(list(samples_test_inds))
         logger.info(
             "For unsupervised training, load in {} unlabeled chunks from the valid/test recording.".format(
-                params["n_support_chunks"]
+                n_support_chunks
             )
         )
         samples = None
@@ -324,19 +350,27 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
                 list(set(np.arange(len(samples_extra))) - set(sample_inds))
             )
             # n_unlabeled_temp = int(params["unlabeled_temp"])
-            n_unlabeled_temp = int(np.ceil(len(samples) * params["unlabeled_temp"]))
+            n_unlabeled_temp = _clip_request_size(
+                int(np.ceil(len(samples) * params["unlabeled_temp"])),
+                len(all_samples_inds_unlabeled),
+                "unlabeled temporal training",
+            )
             logger.info(
                 "Load in {} unlabeled temporal chunks, in addition to {} labels.".format(
                     n_unlabeled_temp, len(samples)
                 )
             )
-            samples_inds_unlabeled = np.random.choice(
-                all_samples_inds_unlabeled, size=n_unlabeled_temp, replace=False
-            )
-            samples_inds_unlabeled = sorted(list(samples_inds_unlabeled))
+            if n_unlabeled_temp > 0:
+                samples_inds_unlabeled = np.random.choice(
+                    all_samples_inds_unlabeled, size=n_unlabeled_temp, replace=False
+                )
+                samples_inds_unlabeled = sorted(list(samples_inds_unlabeled))
 
     sample_inds = sample_inds + samples_inds_unlabeled + samples_test_inds
     sample_inds = np.array(sample_inds)
+
+    if len(sample_inds) == 0:
+        return np.array([], dtype=samples_extra.dtype), labels, []
 
     # generate chunks
     all_samples_inds = get_chunks(
@@ -344,7 +378,7 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
         left_bound,
         right_bound,
         len(samples_extra),
-        downsample=params.get("downsample", 1),
+        downsample=downsample,
     )
 
     # there can be repetitive sampleIDs,
@@ -354,7 +388,9 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
     chunk_list = [
         all_samples[i : i + temp_n] for i in range(0, len(all_samples), temp_n)
     ]
-    all_samples, unique_index = np.unique(all_samples, return_index=True)
+    _, unique_index = np.unique(all_samples, return_index=True)
+    unique_index = np.sort(unique_index)
+    all_samples = all_samples[unique_index]
     labeled_inds = (
         np.array([np.where(all_samples == samp)[0][0] for samp in samples])
         if samples is not None
@@ -766,9 +802,10 @@ def prepend_experiment(
     """
     cameras_ = {}
     datadict_ = {}
-    new_chunks = {}
+    all_chunks = {}
     prev_camnames = camnames.copy()
     for e in range(num_experiments):
+        exp_chunks = {}
 
         # Create a unique camname for each camera in each experiment
         cameras_[e] = {}
@@ -781,14 +818,17 @@ def prepend_experiment(
         for n_cam, name in enumerate(camnames[e]):
             if dannce_prediction:
                 try:
-                    new_chunks[name] = params["experiment"][e]["chunks"][
+                    exp_chunks[name] = params["experiment"][e]["chunks"][
                         prev_camnames[e][n_cam]
                     ]
                 except:
-                    new_chunks[name] = params["experiment"][e]["chunks"][name]
+                    exp_chunks[name] = params["experiment"][e]["chunks"][name]
             else:
-                new_chunks[name] = params["experiment"][e]["chunks"][name]
-        params["experiment"][e]["chunks"] = new_chunks
+                exp_chunks[name] = params["experiment"][e]["chunks"][name]
+        params["experiment"][e]["chunks"] = exp_chunks
+        all_chunks.update(exp_chunks)
+
+    params["chunks"] = all_chunks
 
     for key in datadict.keys():
         enum = key.split("_")[0]

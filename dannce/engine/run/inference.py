@@ -397,9 +397,7 @@ def infer_sdannce(
         params["max_num_samples"] if params["max_num_samples"] != "max" else n_frames
     )
 
-    # s-DANNCE inference processes individual samples, so we iterate over sample indices
-    # not batch indices like regular DANNCE does
-    pbar = tqdm(range(0, min(max_num_sample, n_frames), bs))
+    pbar = tqdm(range(start_ind, end_ind))
     for idx, i in enumerate(pbar):
 
         if (i - start_ind) % 1000 == 0 and i != start_ind:

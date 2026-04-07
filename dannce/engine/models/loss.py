@@ -33,9 +33,7 @@ def compute_mask_nan_loss(loss_fcn, kpts_gt, kpts_pred):
     valid_gt = kpts_gt[notnan_gt]
     valid_pred = kpts_pred[notnan_gt]
     
-    # Compute loss using mean reduction for better gradient flow
-    loss = torch.nn.functional.l1_loss(valid_pred, valid_gt, reduction='mean')
-    return loss
+    return loss_fcn(valid_gt, valid_pred)
 
 
 ##################################################################################################
@@ -290,14 +288,39 @@ class ConsistencyLoss(BaseLoss):
         self.copies_per_sample = copies_per_sample
 
     def forward(self, kpts_gt, kpts_pred):
-        if self.copies_per_sample <= kpts_pred.shape[0]:
+        if self.copies_per_sample < 2:
+            return kpts_pred.sum() * 0
+
+        batch_size = kpts_pred.shape[0]
+        can_group = (
+            batch_size >= self.copies_per_sample
+            and batch_size % self.copies_per_sample == 0
+        )
+
+        if can_group and kpts_gt is not None and kpts_gt.shape[0] == batch_size:
+            kpts_gt_grouped = kpts_gt.reshape(
+                -1, self.copies_per_sample, *kpts_gt.shape[1:]
+            )
+            can_group = bool(
+                torch.all(
+                    torch.isclose(
+                        kpts_gt_grouped[:, 1:],
+                        kpts_gt_grouped[:, :-1],
+                        equal_nan=True,
+                    )
+                )
+            )
+
+        if can_group:
             kpts_pred = kpts_pred.reshape(
                 -1, self.copies_per_sample, *kpts_pred.shape[1:]
             )
         else:
-            # validation
             kpts_pred = kpts_pred.unsqueeze(0)
+
         diff = torch.diff(kpts_pred, dim=1)
+        if diff.numel() == 0:
+            return kpts_pred.sum() * 0
         if self.method == "l1":
             loss_temp = torch.abs(diff).mean()
         else:
