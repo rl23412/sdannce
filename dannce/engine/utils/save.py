@@ -198,12 +198,18 @@ def savedata_expval(
         data = pickle.load(f)
         f.close()
 
-    d_coords = np.zeros((len(list(data.keys())), num_instances, 3, num_markers))
-    t_coords = np.zeros((len(list(data.keys())), num_instances, 3, num_markers))
-    sID = np.zeros((len(list(data.keys())),))
-    p_max = np.zeros((len(list(data.keys())), num_instances, num_markers))
+    keys = list(data.keys())
+    d_coords = np.zeros((len(keys), num_instances, 3, num_markers))
+    t_coords = np.zeros((len(keys), num_instances, 3, num_markers))
+    sID = np.zeros((len(keys),))
+    # If sample IDs are strings like "expID_frameID", MATLAB/NumPy numeric coercion
+    # can silently drop the experiment prefix (e.g. "1_23" -> 123). Preserve a
+    # lossless mapping alongside the numeric sampleID.
+    expID = np.full((len(keys),), -1, dtype=np.int32)
+    frameID = np.full((len(keys),), -1, dtype=np.int64)
+    p_max = np.zeros((len(keys), num_instances, num_markers))
 
-    for (i, key) in enumerate(data.keys()):
+    for (i, key) in enumerate(keys):
         d_coords[i] = data[key]["pred_coord"]
         if tcoord:
             t_coords[i] = np.reshape(
@@ -211,15 +217,34 @@ def savedata_expval(
             )
         if pmax:
             p_max[i] = data[key]["pred_max"]
-        sID[i] = data[key]["sampleID"]
+        sid = data[key]["sampleID"]
+        try:
+            sid_str = sid.decode() if isinstance(sid, (bytes, np.bytes_)) else str(sid)
+        except Exception:
+            sid_str = str(sid)
+        try:
+            sID[i] = float(sid_str)
+        except Exception:
+            sID[i] = np.nan
+        if "_" in sid_str:
+            a, b = sid_str.split("_", 1)
+            if a.lstrip("-").isdigit() and b.lstrip("-").isdigit():
+                expID[i] = int(a)
+                frameID[i] = int(b)
+        else:
+            if sid_str.lstrip("-").isdigit():
+                expID[i] = 0
+                frameID[i] = int(sid_str)
 
-        sdict = {
-            "pred": d_coords,
-            "data": t_coords,
-            "p_max": p_max,
-            "sampleID": sID,
-            # "metadata": #prepare_save_metadata(params),
-        }
+    sdict = {
+        "pred": d_coords,
+        "data": t_coords,
+        "p_max": p_max,
+        "sampleID": sID,
+        "expID": expID,
+        "frameID": frameID,
+        # "metadata": #prepare_save_metadata(params),
+    }
     if write and data is None:
         sio.savemat(
             fname.split(".pickle")[0] + ".mat", sdict,

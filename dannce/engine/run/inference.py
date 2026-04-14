@@ -196,9 +196,16 @@ def infer_com(
 def infer_dannce_inference_range(
     params: Dict, generator: torch.utils.data.Dataset,
 ):
-    n_frames = len(generator)
+    # Get the number of frames from list_IDs if available
+    if hasattr(generator, "list_IDs"):
+        n_frames = len(generator.list_IDs)
+    else:
+        # Fallback to generator length, but this should represent number of batches
+        # for properly implemented generators
+        n_frames = len(generator) * params["batch_size"]
+    
     bs = params["batch_size"]
-    generator_maxbatch = np.ceil(n_frames / bs)
+    generator_maxbatch = np.ceil(n_frames/bs)
 
     if params["maxbatch"] != "max" and params["maxbatch"] > generator_maxbatch:
         print(
@@ -237,6 +244,8 @@ def infer_dannce(
     """
     start_ind, end_ind, bs, _ = infer_dannce_inference_range(params, generator)
     save_data = {}
+    valid_sampleIDs = partition.get("valid_sampleIDs", [])
+    n_valid = len(valid_sampleIDs)
 
     if save_heatmaps:
         save_path = os.path.join(params["dannce_predict_dir"], "heatmaps")
@@ -310,7 +319,12 @@ def infer_dannce(
             pred = pred[0].detach().cpu().numpy()
             for j in range(pred.shape[0]):
                 pred_max = probmap[j]
-                sampleID = partition["valid_sampleIDs"][i * bs + j]
+                global_idx = i * bs + j
+                # Some generators pad the final batch to a full batch size. Skip padded
+                # entries that do not have corresponding sample IDs.
+                if global_idx >= n_valid:
+                    continue
+                sampleID = valid_sampleIDs[global_idx]
                 save_data[idx * bs + j] = {
                     "pred_max": pred_max,
                     "pred_coord": pred[j],
@@ -328,7 +342,10 @@ def infer_dannce(
                 (xcoord, ycoord, zcoord,) = image_utils.plot_markers_3d_torch(preds)
                 coord = torch.stack([xcoord, ycoord, zcoord])
                 pred_log = pred_max.log() - pred_total.log()
-                sampleID = partition["valid_sampleIDs"][i * bs + j]
+                global_idx = i * bs + j
+                if global_idx >= n_valid:
+                    continue
+                sampleID = valid_sampleIDs[global_idx]
 
                 save_data[idx * bs + j] = {
                     "pred_max": pred_max.cpu().numpy(),

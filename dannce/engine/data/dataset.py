@@ -52,6 +52,8 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         list_IDs,
         data,
         labels,
+        labels_2d,
+        cameras=None,
         rotation=True,
         random=True,
         chan_num=3,
@@ -78,12 +80,16 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         occlusion=False,
         pairs=None,
         transformed_batch=False,
+        partition=None,  # Add partition parameter
+        sample_id_lookup=None,
     ):
         """Initialize data generator.
         """
         self.list_IDs = list_IDs
         self.data = data
         self.labels = labels
+        self.labels_2d = labels_2d
+        self.cameras = cameras
         self.rotation = rotation
         self.random = random
         self.chan_num = chan_num
@@ -120,6 +126,14 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         if self.pairs is not None:
             self.temporal_chunk_size = len(self.pairs[0])
 
+        self.partition = partition
+        if self.partition is not None:
+            self.train_sample_ids = self.partition.get('train_sampleIDs', [])
+            self.valid_sample_ids = self.partition.get('valid_sampleIDs', [])
+        self.sample_id_lookup = (
+            list(sample_id_lookup) if sample_id_lookup is not None else None
+        )
+
         self._update_temporal_batch_size()
 
     def __len__(self):
@@ -144,6 +158,79 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         if self.pairs is not None:
             self.temporal_chunk_size = len(self.pairs[0])
 
+    def _resolve_sample_ids(self, list_IDs_temp):
+        if isinstance(list_IDs_temp, (list, tuple, np.ndarray)):
+            raw_ids = list(list_IDs_temp)
+        else:
+            raw_ids = [list_IDs_temp]
+
+        sample_ids = []
+        for raw_id in raw_ids:
+            if (
+                self.sample_id_lookup is not None
+                and isinstance(raw_id, (int, np.integer))
+                and 0 <= int(raw_id) < len(self.sample_id_lookup)
+            ):
+                sample_ids.append(str(self.sample_id_lookup[int(raw_id)]))
+            else:
+                sample_ids.append(str(raw_id))
+
+        return sample_ids
+
+    def _extract_camera_targets(self, sample_ids, field):
+        if self.labels_2d is None:
+            return None
+
+        if field == "visibility":
+            has_visibility = any(
+                isinstance(self.labels_2d.get(sample_id), dict)
+                and "visibility" in self.labels_2d[sample_id]
+                for sample_id in sample_ids
+            )
+            if not has_visibility:
+                return None
+
+        reference_shapes = {}
+        for sample_id in sample_ids:
+            sample_entry = self.labels_2d.get(sample_id)
+            if not isinstance(sample_entry, dict):
+                continue
+            for cam_name, cam_data in sample_entry.get("data", {}).items():
+                cam_shape = np.asarray(cam_data).shape
+                if field == "data":
+                    reference_shapes.setdefault(cam_name, cam_shape)
+                else:
+                    reference_shapes.setdefault(cam_name, (cam_shape[-1],))
+
+        if len(reference_shapes) == 0:
+            return None
+
+        camera_targets = {cam_name: [] for cam_name in reference_shapes}
+        for sample_id in sample_ids:
+            sample_entry = self.labels_2d.get(sample_id)
+            sample_entry = sample_entry if isinstance(sample_entry, dict) else {}
+            field_map = sample_entry.get(field, {})
+            data_map = sample_entry.get("data", {})
+
+            for cam_name, ref_shape in reference_shapes.items():
+                if field == "data":
+                    cam_value = data_map.get(cam_name)
+                    if cam_value is None:
+                        cam_value = np.full(ref_shape, np.nan, dtype=np.float32)
+                    cam_value = np.asarray(cam_value, dtype=np.float32)
+                else:
+                    cam_value = field_map.get(cam_name) if isinstance(field_map, dict) else None
+                    if cam_value is None:
+                        cam_value = np.zeros(ref_shape, dtype=bool)
+                    cam_value = np.asarray(cam_value, dtype=bool)
+
+                camera_targets[cam_name].append(cam_value)
+
+        return {
+            cam_name: np.stack(cam_values, axis=0)
+            for cam_name, cam_values in camera_targets.items()
+        }
+
     def __getitem__(self, index):
         """Generate one batch of data.
 
@@ -162,7 +249,11 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         else:
             list_IDs_temp = [self.list_IDs[index]]
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
-        return X, X_grid, y_3d, aux
+        sample_ids_temp = self._resolve_sample_ids(list_IDs_temp)
+        y_2d = self._extract_camera_targets(sample_ids_temp, "data")
+        visibility_2d = self._extract_camera_targets(sample_ids_temp, "visibility")
+
+        return X, X_grid, y_3d, aux, y_2d, sample_ids_temp, visibility_2d
 
     def rot90(self, X):
         """Rotate X by 90 degrees CCW.
@@ -256,16 +347,33 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         """
         # torchvision.transforms.functional.affine - input: [..., H, W]
         rotangle = np.random.rand() * (2 * max_delta) - max_delta
-        X = (
-            torch.from_numpy(X).reshape(*X.shape[:3], -1).permute(0, 3, 1, 2)
-        )  # dimension [B, D*C, H, W]
-        y_3d = torch.from_numpy(y_3d).reshape(y_3d.shape[:3], -1).permute(0, 3, 1, 2)
-        for i in range(X.shape[0]):
-            X[i] = TF.affine(X[i], angle=rotangle)
-            y_3d[i] = TF.affine(y_3d[i], angle=rotangle)
+        X_shape = X.shape
+        y_3d_shape = y_3d.shape
 
-        X = X.permute(0, 2, 3, 1).reshape(*X.shape[:3], X.shape[2], -1).numpy()
-        y_3d = y_3d.permute(0, 2, 3, 1).reshape(*X.shape[:3], X.shape[2], -1).numpy()
+        X = torch.from_numpy(X).reshape(*X_shape[:3], -1).permute(
+            0, 3, 1, 2
+        )  # dimension [B, D*C, H, W]
+        y_3d = torch.from_numpy(y_3d).reshape(*y_3d_shape[:3], -1).permute(0, 3, 1, 2)
+        for i in range(X.shape[0]):
+            X[i] = TF.affine(
+                X[i],
+                angle=rotangle,
+                translate=[0, 0],
+                scale=1.0,
+                shear=[0.0, 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            y_3d[i] = TF.affine(
+                y_3d[i],
+                angle=rotangle,
+                translate=[0, 0],
+                scale=1.0,
+                shear=[0.0, 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+
+        X = X.permute(0, 2, 3, 1).reshape(*X_shape).numpy()
+        y_3d = y_3d.permute(0, 2, 3, 1).reshape(*y_3d_shape).numpy()
 
         return X, y_3d
 
@@ -447,9 +555,15 @@ class PoseDatasetFromMem(torch.utils.data.Dataset):
         return np.stack(inds, axis=1)
 
     def _convert_numpy_to_tensor(self, X, X_grid, y_3d, aux):
+        # Mirror/flip augmentations can create numpy views with negative strides.
+        # torch.from_numpy does not support negative strides, so force contiguous arrays.
+        X = np.ascontiguousarray(X)
+        y_3d = np.ascontiguousarray(y_3d)
         if X_grid is not None:
+            X_grid = np.ascontiguousarray(X_grid)
             X_grid = torch.from_numpy(X_grid)
         if aux is not None:
+            aux = np.ascontiguousarray(aux)
             aux = torch.from_numpy(aux).permute(0, 4, 1, 2, 3)
 
         return (
@@ -558,7 +672,9 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         self,
         list_IDs,
         labels_3d,
+        labels_2d,
         npydir,
+        cameras=None,
         # batch_size,
         imdir="image_volumes",
         griddir="grid_volumes",
@@ -575,6 +691,7 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         Args:
             list_IDs (List): List of sampleIDs
             labels_3d (Dict): training targets
+            labels_2d (Dict): 2d training targets
             npydir (Dict): path to each npy volume folder for each recording (i.e. experiment)
             batch_size (int): Batch size
             imdir (Text, optional): Name of image volume npy subfolder
@@ -585,9 +702,11 @@ class PoseDatasetNPY(PoseDatasetFromMem):
             sigma (float, optional): For MAX network, size of target Gaussian (mm)
         """
         super(PoseDatasetNPY, self).__init__(
-            list_IDs=list_IDs, data=None, labels=None, **kwargs
+            list_IDs=list_IDs, data=None, labels=None, labels_2d=labels_2d, cameras=cameras, **kwargs
         )
         self.labels_3d = labels_3d
+        self.labels_2d = labels_2d
+        self.cameras = cameras
         self.npydir = npydir
         self.griddir = griddir
         self.imdir = imdir
@@ -598,6 +717,28 @@ class PoseDatasetNPY(PoseDatasetFromMem):
         self.sigma = sigma
         self.auxdir = auxdir
         self.aux = aux
+
+        # Filter out IDs that don't have required NPY files on disk
+        try:
+            filtered_IDs = []
+            missing = 0
+            for ID in list_IDs:
+                try:
+                    eID_str, sID = ID.split("_")
+                    eID = int(eID_str)
+                except Exception:
+                    filtered_IDs.append(ID)
+                    continue
+                im_path = os.path.join(self.npydir[eID], self.imdir, f"0_{sID}.npy")
+                grid_path = os.path.join(self.npydir[eID], self.griddir, f"0_{sID}.npy")
+                if os.path.exists(im_path) and os.path.exists(grid_path):
+                    filtered_IDs.append(ID)
+                else:
+                    missing += 1
+            if missing:
+                self.list_IDs = filtered_IDs
+        except Exception:
+            pass
 
     def __getitem__(self, index):
         """Generate one batch of data.
@@ -619,7 +760,12 @@ class PoseDatasetNPY(PoseDatasetFromMem):
             list_IDs_temp = [self.list_IDs[index]]
         # Generate data
         X, X_grid, y_3d, aux = self.__data_generation(list_IDs_temp)
-        return X, X_grid, y_3d, aux
+
+        sample_ids_temp = self._resolve_sample_ids(list_IDs_temp)
+        y_2d = self._extract_camera_targets(sample_ids_temp, "data")
+        visibility_2d = self._extract_camera_targets(sample_ids_temp, "visibility")
+
+        return X, X_grid, y_3d, aux, y_2d, sample_ids_temp, visibility_2d
 
     def _downscale_occluded_views(self, X, occlusion_scores):
         """
@@ -853,6 +999,21 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         self.shear_val = shear_val
         self.zoom_val = zoom_val
 
+        self.list_IDs = self._group_list_ids(self.list_IDs)
+
+    def _group_list_ids(self, list_IDs):
+        if len(list_IDs) == 0:
+            return []
+
+        first_item = list_IDs[0]
+        if np.isscalar(first_item):
+            return [
+                np.asarray(list_IDs[i : i + self.batch_size])
+                for i in range(0, len(list_IDs), self.batch_size)
+            ]
+
+        return [np.asarray(ids) for ids in list_IDs]
+
     def __len__(self):
         return len(self.list_IDs)
 
@@ -895,7 +1056,7 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         return X, y_2d
 
     def __getitem__(self, index):
-        list_IDs_temp = [self.list_IDs[index]]
+        list_IDs_temp = self.list_IDs[index]
         X, y = self.__data_generation(list_IDs_temp)
 
         return X, y
@@ -904,8 +1065,9 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
         """Generate data containing batch_size samples."""
         # Initialization
 
-        X = np.zeros((self.batch_size, *self.data.shape[1:]))
-        y_2d = np.zeros((self.batch_size, *self.labels.shape[1:]))
+        n_ids = len(list_IDs_temp)
+        X = np.zeros((n_ids, *self.data.shape[1:]), dtype=self.data.dtype)
+        y_2d = np.zeros((n_ids, *self.labels.shape[1:]), dtype=self.labels.dtype)
 
         for i, ID in enumerate(list_IDs_temp):
             X[i] = self.data[ID].copy()
@@ -927,20 +1089,36 @@ class COMDatasetFromMem(torch.utils.data.Dataset):
             # TODO: replace with torchvision.transforms
             if self.augment_rotation:
                 affine["rotation"] = self.rotation_val * (np.random.rand() * 2 - 1)
-            # if self.augment_zoom:
-            #     affine["zoom"] = self.zoom_val * (np.random.rand() * 2 - 1) + 1
+            if self.augment_zoom:
+                affine["zoom"] = self.zoom_val * (np.random.rand() * 2 - 1) + 1
             if self.augment_shear:
                 affine["shear"] = self.shear_val * (np.random.rand() * 2 - 1)
 
+            X = torch.from_numpy(X).permute(0, 3, 1, 2).float()
+            y_2d = torch.from_numpy(y_2d).permute(0, 3, 1, 2).float()
+
             X = TF.affine(
-                torch.from_numpy(X).permute(0, 3, 1, 2),
+                X,
                 angle=affine["rotation"],
-                shear=affine["shear"],
+                translate=[0, 0],
+                scale=affine["zoom"],
+                shear=[affine["shear"], 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
             )
             y_2d = TF.affine(
-                torch.from_numpy(y_2d).permute(0, 3, 1, 2),
+                y_2d,
                 angle=affine["rotation"],
-                shear=affine["shear"],
+                translate=[0, 0],
+                scale=affine["zoom"],
+                shear=[affine["shear"], 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+
+            X = X.permute(0, 2, 3, 1).numpy().astype(self.data.dtype, copy=False)
+            y_2d = (
+                y_2d.permute(0, 2, 3, 1)
+                .numpy()
+                .astype(self.labels.dtype, copy=False)
             )
 
         if self.augment_shift:

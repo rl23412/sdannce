@@ -513,23 +513,31 @@ class DataGenerator_3Dconv(DataGenerator):
         return X, y_3d, X_grid
 
     def _generate_coord_grid(self, this_COM_3d):
+        # torch.arange expects Python numbers; cast scalar tensors to floats for newer torch
+        x_start = float((self.vmin + this_COM_3d[0] + self.vsize / 2).item())
+        x_end = float((this_COM_3d[0] + self.vmax).item())
+        y_start = float((self.vmin + this_COM_3d[1] + self.vsize / 2).item())
+        y_end = float((this_COM_3d[1] + self.vmax).item())
+        z_start = float((self.vmin + this_COM_3d[2] + self.vsize / 2).item())
+        z_end = float((this_COM_3d[2] + self.vmax).item())
+
         xgrid = torch.arange(
-            self.vmin + this_COM_3d[0] + self.vsize / 2,
-            this_COM_3d[0] + self.vmax,
+            x_start,
+            x_end,
             self.vsize,
             dtype=torch.float32,
             device=self.device,
         )
         ygrid = torch.arange(
-            self.vmin + this_COM_3d[1] + self.vsize / 2,
-            this_COM_3d[1] + self.vmax,
+            y_start,
+            y_end,
             self.vsize,
             dtype=torch.float32,
             device=self.device,
         )
         zgrid = torch.arange(
-            self.vmin + this_COM_3d[2] + self.vsize / 2,
-            this_COM_3d[2] + self.vmax,
+            z_start,
+            z_end,
             self.vsize,
             dtype=torch.float32,
             device=self.device,
@@ -646,6 +654,9 @@ class DataGenerator_3Dconv(DataGenerator):
         # Initialization
         first_exp = int(self.list_IDs[0].split("_")[0])
         X, y_3d, X_grid = self._init_vars(first_exp)
+        
+        # Initialize num_cams based on first experiment to ensure it's always defined
+        num_cams = len(self.camnames[first_exp])
 
         # Generate data
         for i, ID in enumerate(list_IDs_temp):
@@ -755,7 +766,7 @@ class DataGenerator_3Dconv_social(DataGenerator_3Dconv):
         Returns:
             int: Batches per epoch
         """
-        return len(self.list_IDs)
+        return int(np.floor(len(self.list_IDs) / self.batch_size))
 
     def __getitem__(self, index: int):
         """Generate one batch of data.

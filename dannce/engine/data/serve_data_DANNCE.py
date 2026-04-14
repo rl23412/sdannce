@@ -1,7 +1,7 @@
 """Define routines for reading/structuring input data for DANNCE."""
 import os
 import pickle
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 import warnings
 
 import numpy as np
@@ -152,14 +152,25 @@ def prepare_data(
             np.reshape(data_3d, [data_3d.shape[0], -1, 3]), [0, 2, 1]
         )
 
-    # If specific markers are set to be excluded, set them to NaN here.
+    # If specific markers are set to be excluded, set them to NaN in both 3D
+    # labels and per-camera 2D targets so they do not contribute to either loss.
     if params["drop_landmark"] is not None and (stage != "predict"):
         logger.info(
-            "Setting landmarks {} to NaN. These landmarks will not be included in loss or metric evaluations".format(
+            "Setting landmarks {} to NaN in 3D and matching 2D targets. "
+            "These landmarks will not be included in loss or metric evaluations".format(
                 params["drop_landmark"]
             )
         )
-        data_3d[:, :, params["drop_landmark"]] = np.nan
+        drop_landmarks = sorted({int(idx) for idx in params["drop_landmark"]})
+        valid_3d_drop = [idx for idx in drop_landmarks if idx < data_3d.shape[2]]
+        if len(valid_3d_drop) > 0:
+            data_3d[:, :, valid_3d_drop] = np.nan
+        for cam_name, cam_data in ddict.items():
+            if cam_data.ndim != 3 or cam_data.shape[2] != data_3d.shape[2]:
+                continue
+            valid_2d_drop = [idx for idx in drop_landmarks if idx < cam_data.shape[2]]
+            if len(valid_2d_drop) > 0:
+                cam_data[:, :, valid_2d_drop] = np.nan
 
     valid_sample_length = min(
         len(samples),
@@ -228,8 +239,48 @@ def get_chunks(
 
         chunk_ind_list.append(chunk)
 
+    if len(chunk_ind_list) == 0:
+        return np.array([], dtype=int)
+
     all_samples_inds = np.concatenate(chunk_ind_list).astype(int)
     return all_samples_inds
+
+
+def _temporal_anchor_budget(params: Dict, valid: bool) -> Optional[int]:
+    """Return the desired number of labeled anchor samples before chunk expansion."""
+    if valid:
+        budget = params.get("num_validation_per_exp")
+    else:
+        budget = params.get("num_train_per_exp")
+        valid_budget = params.get("num_validation_per_exp")
+        if budget not in (None, "max") and valid_budget not in (None, "max"):
+            budget = int(budget) + int(valid_budget)
+
+    if budget in (None, "max"):
+        return None
+    return int(budget)
+
+
+def _subsample_temporal_anchor_samples(params: Dict, samples, valid: bool):
+    """Subsample labeled temporal anchors before neighborhood chunk expansion."""
+    budget = _temporal_anchor_budget(params, valid)
+    samples = np.asarray(samples)
+    if budget is None or budget >= len(samples):
+        return samples
+
+    seed = params.get("data_split_seed")
+    rng = np.random.default_rng(seed)
+    keep_idx = np.sort(rng.choice(len(samples), size=budget, replace=False))
+    selected = samples[keep_idx]
+    logger.info(
+        "Temporal anchor prefilter selected {} / {} labeled samples for {} stage "
+        "before chunk expansion.".format(
+            len(selected),
+            len(samples),
+            "validation" if valid else "training",
+        )
+    )
+    return selected
 
 
 def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
@@ -249,23 +300,47 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
     # select extra samples from the neighborhood of labeled samples
     # each of which is referred as a "temporal chunk"
     left_bound, right_bound = get_seq_bounds(temp_n)
+    downsample = params.get("downsample", 1)
+
+    def _clip_request_size(requested, available, context):
+        if requested is None:
+            return 0
+        requested = int(requested)
+        if requested <= 0 or available <= 0:
+            return 0
+        clipped = min(requested, available)
+        if clipped < requested:
+            logger.warning(
+                "Requested {} temporal chunks for {}, but only {} are available. "
+                "Clipping request.".format(requested, context, clipped)
+            )
+        return clipped
+
+    valid_support_inds = np.arange(
+        max(0, -left_bound * downsample),
+        max(0, len(samples_extra) - max(0, (right_bound - 1) * downsample)),
+        max(1, temp_n * downsample),
+    )
 
     # what if we want to use the unlabeled frames in the test set for pretraining
     sample_inds, samples_inds_unlabeled, samples_test_inds = [], [], []
     if (support) and isinstance(params["n_support_chunks"], int):
-        samples_test_inds = np.random.choice(
-            samples_extra[-left_bound::temp_n],
-            size=params["n_support_chunks"],
-            replace=False,
+        n_support_chunks = _clip_request_size(
+            params["n_support_chunks"], len(valid_support_inds), "support pretraining"
         )
-        samples_test_inds = sorted(list(samples_test_inds))
+        if n_support_chunks > 0:
+            samples_test_inds = np.random.choice(
+                valid_support_inds, size=n_support_chunks, replace=False,
+            )
+            samples_test_inds = sorted(list(samples_test_inds))
         logger.info(
             "For unsupervised training, load in {} unlabeled chunks from the valid/test recording.".format(
-                params["n_support_chunks"]
+                n_support_chunks
             )
         )
         samples = None
     else:
+        samples = _subsample_temporal_anchor_samples(params, samples, valid)
         # locate labeled frames
         sample_inds = [np.where(samples_extra == samp)[0][0] for samp in samples]
 
@@ -275,19 +350,27 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
                 list(set(np.arange(len(samples_extra))) - set(sample_inds))
             )
             # n_unlabeled_temp = int(params["unlabeled_temp"])
-            n_unlabeled_temp = int(np.ceil(len(samples) * params["unlabeled_temp"]))
+            n_unlabeled_temp = _clip_request_size(
+                int(np.ceil(len(samples) * params["unlabeled_temp"])),
+                len(all_samples_inds_unlabeled),
+                "unlabeled temporal training",
+            )
             logger.info(
                 "Load in {} unlabeled temporal chunks, in addition to {} labels.".format(
                     n_unlabeled_temp, len(samples)
                 )
             )
-            samples_inds_unlabeled = np.random.choice(
-                all_samples_inds_unlabeled, size=n_unlabeled_temp, replace=False
-            )
-            samples_inds_unlabeled = sorted(list(samples_inds_unlabeled))
+            if n_unlabeled_temp > 0:
+                samples_inds_unlabeled = np.random.choice(
+                    all_samples_inds_unlabeled, size=n_unlabeled_temp, replace=False
+                )
+                samples_inds_unlabeled = sorted(list(samples_inds_unlabeled))
 
     sample_inds = sample_inds + samples_inds_unlabeled + samples_test_inds
     sample_inds = np.array(sample_inds)
+
+    if len(sample_inds) == 0:
+        return np.array([], dtype=samples_extra.dtype), labels, []
 
     # generate chunks
     all_samples_inds = get_chunks(
@@ -295,7 +378,7 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
         left_bound,
         right_bound,
         len(samples_extra),
-        downsample=params.get("downsample", 1),
+        downsample=downsample,
     )
 
     # there can be repetitive sampleIDs,
@@ -305,7 +388,9 @@ def prepare_temporal_seqs(params, samples, labels, valid=False, support=False):
     chunk_list = [
         all_samples[i : i + temp_n] for i in range(0, len(all_samples), temp_n)
     ]
-    all_samples, unique_index = np.unique(all_samples, return_index=True)
+    _, unique_index = np.unique(all_samples, return_index=True)
+    unique_index = np.sort(unique_index)
+    all_samples = all_samples[unique_index]
     labeled_inds = (
         np.array([np.where(all_samples == samp)[0][0] for samp in samples])
         if samples is not None
@@ -633,19 +718,36 @@ def remove_samples_com(s, com3d_dict, cthresh=350, rmc=False):
     (i.e. no camera pair above threshold for a given frame)
     Also, let's remove any sample where abs(COM) is > 350
     """
+    s = np.asarray(s)
     sample_mask = np.ones((len(s),), dtype="bool")
+    dropped_missing = 0
+    dropped_nonfinite = 0
+    dropped_thresh = 0
 
     for i in range(len(s)):
         if s[i] not in com3d_dict:
             sample_mask[i] = 0
+            dropped_missing += 1
         else:
-            if np.isnan(np.sum(com3d_dict[s[i]])):
+            com = np.asarray(com3d_dict[s[i]], dtype=float)
+            if not np.all(np.isfinite(com)):
                 sample_mask[i] = 0
-            if rmc:
-                if np.any(np.abs(com3d_dict[s[i]]) > cthresh):
-                    sample_mask[i] = 0
+                dropped_nonfinite += 1
+            elif rmc and np.any(np.abs(com) > cthresh):
+                sample_mask[i] = 0
+                dropped_thresh += 1
 
     s = s[sample_mask]
+    if dropped_missing or dropped_nonfinite or dropped_thresh:
+        logger.info(
+            "Removed {} samples due to invalid COMs (missing={}, nonfinite={}, "
+            "outside_cthresh={}).".format(
+                dropped_missing + dropped_nonfinite + dropped_thresh,
+                dropped_missing,
+                dropped_nonfinite,
+                dropped_thresh,
+            )
+        )
     return s
 
 
@@ -700,9 +802,10 @@ def prepend_experiment(
     """
     cameras_ = {}
     datadict_ = {}
-    new_chunks = {}
+    all_chunks = {}
     prev_camnames = camnames.copy()
     for e in range(num_experiments):
+        exp_chunks = {}
 
         # Create a unique camname for each camera in each experiment
         cameras_[e] = {}
@@ -715,14 +818,17 @@ def prepend_experiment(
         for n_cam, name in enumerate(camnames[e]):
             if dannce_prediction:
                 try:
-                    new_chunks[name] = params["experiment"][e]["chunks"][
+                    exp_chunks[name] = params["experiment"][e]["chunks"][
                         prev_camnames[e][n_cam]
                     ]
                 except:
-                    new_chunks[name] = params["experiment"][e]["chunks"][name]
+                    exp_chunks[name] = params["experiment"][e]["chunks"][name]
             else:
-                new_chunks[name] = params["experiment"][e]["chunks"][name]
-        params["experiment"][e]["chunks"] = new_chunks
+                exp_chunks[name] = params["experiment"][e]["chunks"][name]
+        params["experiment"][e]["chunks"] = exp_chunks
+        all_chunks.update(exp_chunks)
+
+    params["chunks"] = all_chunks
 
     for key in datadict.keys():
         enum = key.split("_")[0]
@@ -781,7 +887,87 @@ def collate_fn(items):
     except:
         auxs = None
 
-    return volumes, grids, targets, auxs
+    def _base_camera_name(cam_name):
+        if "_" in cam_name and cam_name.split("_")[0].isdigit():
+            return "_".join(cam_name.split("_")[1:])
+        return cam_name
+
+    def _collate_camera_dict(field_index, fill_factory):
+        camera_groups = {}
+        batch_size = len(items)
+
+        for item_idx, item in enumerate(items):
+            if len(item) <= field_index or not isinstance(item[field_index], dict):
+                continue
+
+            for cam_name, cam_data in item[field_index].items():
+                base_cam = _base_camera_name(cam_name)
+                if base_cam not in camera_groups:
+                    camera_groups[base_cam] = {}
+
+                if torch.is_tensor(cam_data):
+                    cam_data = cam_data.detach().cpu().numpy()
+
+                camera_groups[base_cam][item_idx] = np.asarray(cam_data)
+
+        collated = {}
+        for base_cam, item_data in camera_groups.items():
+            ref_shape = None
+            for item_idx in range(batch_size):
+                if item_idx in item_data:
+                    ref_shape = item_data[item_idx].shape
+                    break
+
+            if ref_shape is None:
+                continue
+
+            batches = []
+            for item_idx in range(batch_size):
+                if item_idx in item_data:
+                    batches.append(item_data[item_idx])
+                else:
+                    batches.append(fill_factory(ref_shape))
+
+            collated[base_cam] = np.concatenate(batches, axis=0)
+
+        return collated or None
+
+    labels_2d = None
+    visibility_2d = None
+    # Track sample IDs per batch row (optional). This preserves alignment with volumes
+    sample_ids_batch = None
+    try:
+        # Each item may optionally include a list of sample IDs at index 5
+        # We flatten these in the same order as we concatenate batch tensors
+        collected = []
+        for it in items:
+            if len(it) > 5 and it[5] is not None:
+                if isinstance(it[5], (list, tuple)):
+                    collected.extend([str(x) for x in it[5]])
+                else:
+                    collected.append(str(it[5]))
+        if len(collected) > 0:
+            sample_ids_batch = collected
+    except Exception:
+        sample_ids_batch = None
+
+    if any(len(item) > 4 and item[4] is not None for item in items):
+        if any(isinstance(item[4], dict) for item in items if len(item) > 4):
+            labels_2d = _collate_camera_dict(
+                4, lambda shape: np.full(shape, np.nan, dtype=np.float32)
+            )
+        else:
+            try:
+                labels_2d = torch.cat([item[4] for item in items], dim=0)
+            except Exception:
+                labels_2d = None
+
+    if any(len(item) > 6 and item[6] is not None for item in items):
+        visibility_2d = _collate_camera_dict(
+            6, lambda shape: np.zeros(shape, dtype=bool)
+        )
+
+    return volumes, grids, targets, auxs, labels_2d, sample_ids_batch, visibility_2d
 
 
 def setup_dataloaders(train_dataset, valid_dataset, params):
@@ -797,21 +983,22 @@ def setup_dataloaders(train_dataset, valid_dataset, params):
         valid_batch_size = valid_batch_size * len(params["gpu_id"])
         logger.info(f"Use batch size of {valid_batch_size} for multiple GPUs.")
 
+    # Use single-process data loading to avoid worker segfaults on this cluster.
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=valid_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=0,
+        persistent_workers=False,
     )
     valid_dataloader = torch.utils.data.DataLoader(
         valid_dataset,
         valid_batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=0,
+        persistent_workers=False,
     )
     return train_dataloader, valid_dataloader
 

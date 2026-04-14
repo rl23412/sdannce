@@ -78,7 +78,7 @@ class ConfigBaseTrain:
     epochs: int = 50
     save_period: int = 10
     lr: float = 1e-4
-    lr_scheduler: str | None = None
+    lr_scheduler: dict | None = None
     loss: str = "L1Loss"
     metric: str | None = None
     norm_method: Literal["layer", "instance", "batch"] = "layer"
@@ -170,6 +170,7 @@ class ConfigDANNCETrain(ConfigDANNCEBase, ConfigBaseTrain):
 
     batch_augmentation: bool = False
     batch_aug_size: int | None = None
+    cache_all_npy: bool = True
 
     # automatic sampling of unlabeled data for semi-supervised training
     unlabeled_sampling: str | int | float = "equal"
@@ -177,6 +178,57 @@ class ConfigDANNCETrain(ConfigDANNCEBase, ConfigBaseTrain):
     # for dataset already with unlabeled samples (marked as NaN),
     # adjust post hoc the fraction of unlabeled samples, relative to total samples
     unlabeled_fraction: int | float | None = None
+
+    # Enable training with 2D labels from single camera views
+    train_on_2d: bool = False
+    train_on_2d_use_default_learned_visibility: bool = True
+    filter_samples_without_finite_2d: bool = False
+    filter_samples_without_finite_2d_min_points: int = 1
+    exclude_occluded_2d: bool = False
+    exclude_occluded_2d_mode: str = "capsule_raycast"
+    exclude_occluded_2d_reproj_guard_px: float = 20.0
+    exclude_occluded_2d_reproj_only_from_stored3d: bool = False
+    exclude_occluded_2d_min_support_views: int = 2
+    exclude_occluded_2d_learned_torso_quantile: float = 0.95
+    exclude_occluded_2d_learned_torso_margin: float = 1.05
+    exclude_occluded_2d_temporal_reference: bool = False
+    exclude_occluded_2d_temporal_window: int = 3
+    exclude_occluded_2d_temporal_jump_filter: bool = True
+    exclude_occluded_2d_temporal_jump_window: int = 5
+    exclude_occluded_2d_temporal_jump_thresh_px: float = 75.0
+    exclude_occluded_2d_com_filter: bool = False
+    exclude_occluded_2d_com_filter_window: int = 5
+    exclude_occluded_2d_com_filter_thresh_px: float = 60.0
+    exclude_occluded_2d_com_filter_require_two_sided: bool = True
+    exclude_occluded_2d_bone_prior_rescue: bool = False
+    exclude_occluded_2d_bone_prior_max_z: float = 3.0
+    exclude_occluded_2d_bone_prior_min_support_bones: int = 1
+    exclude_occluded_2d_bone_prior_std_floor: float = 0.05
+    exclude_occluded_2d_joint_radius_overrides_mm: dict | None = None
+    learned_visibility_enabled: bool = False
+    learned_visibility_hidden_dim: int = 128
+    learned_visibility_loss_weight: float = 1.0
+    learned_visibility_threshold: float = 0.5
+    learned_visibility_warmup_epochs: int = 1
+    learned_visibility_stop_bce_below: float | None = None
+    learned_visibility_stop_bce_metric: str = "val"
+    learned_visibility_stop_bce_after_epoch: int = 1
+    
+    # Loss stability parameters for 2D reprojection
+    clip_2d_loss: bool = True
+    max_2d_loss_value: float = 70.0
+    clip_projections: bool = True
+    max_projection_coord: float = 5000.0
+    check_3d_bounds: bool = True
+    check_projection_bounds: bool = True
+    gradient_clip_norm: float | None = None
+
+    # 2D Confidence weighting parameters for Label3D integration
+    use_2d_confidence_weighting: bool = False
+    min_confidence_threshold: float = 0.5
+    confidence_loss_weighting_method: str = "linear"  # linear, sigmoid, exponential
+    per_camera_2d_loss_weights: dict | None = None
+    confidence_weighting_strength: float = 1.0  # Scaling factor for confidence weights
 
 
 @dataclass
@@ -204,6 +256,7 @@ class COMAugmentation:
     augment_rotation: bool = False
     augment_shear: bool = False
     augment_zoom: bool = False
+    augment_shift: bool = False
     augment_shear_val: int = 5
     augment_zoom_val: float = 0.05
     augment_shift_val: float = 0.05
@@ -217,7 +270,7 @@ class ConfigCOMTrain(ConfigBaseTrain, ConfigCOMBase, COMAugmentation):
 
     # Training
     lr: float = 5e-5
-    lr_scheduler: str | None = None
+    lr_scheduler: dict | None = None
     n_channels_out: int = 1
 
 

@@ -260,6 +260,8 @@ def load_all_com_exps(params: Dict, exps: List):
     camnames = {}
     datadict = {}
     datadict_3d = {}
+    com3d_dict = {}
+    temporal_chunks = {}
     samples = []
     for e, expdict in enumerate(exps):
 
@@ -298,7 +300,16 @@ def load_all_com_exps(params: Dict, exps: List):
 
     samples = np.array(samples)
 
-    return samples, datadict, datadict_3d, cameras, camnames, total_chunks
+    return (
+        samples,
+        datadict,
+        datadict_3d,
+        com3d_dict,
+        cameras,
+        camnames,
+        total_chunks,
+        temporal_chunks,
+    )
 
 
 def do_COM_load(exp: Dict, expdict: Dict, e, params: Dict, training=True):
@@ -440,8 +451,43 @@ DATA SPLITS
 """
 
 
+def print_split_debug_info(split_name: str, sample_ids: List, datadict: Dict):
+    """Prints debug information about a data split."""
+    logger.info(f"🔍 ANALYZING {split_name.upper()} SPLIT...")
+    if len(sample_ids) == 0:
+        logger.info(f"  No samples in the {split_name} set.")
+        return
+
+    # Sort sample IDs for consistent output
+    sorted_samples = sorted(list(sample_ids))
+
+    logger.info(f"  {split_name.capitalize()} set contains {len(sorted_samples)} samples.")
+    
+    # Print header
+    header = f"  {'Sample ID':<20} | {'Experiment':<12} | {'Frame Index (from datadict)':<30}"
+    logger.info(header)
+    logger.info(f"  {'-'*20} | {'-'*12} | {'-'*30}")
+
+    for sample_id in sorted_samples[:15]:  # Print details for the first 15 samples
+        if sample_id in datadict and "frames" in datadict[sample_id]:
+            exp_id = sample_id.split("_")[0]
+            
+            # Since frames can be a dict, we'll represent it as a string
+            frames_info = datadict[sample_id]["frames"]
+            frames_str = ", ".join([f"{cam}: {frame}" for cam, frame in frames_info.items()])
+            
+            log_entry = f"  {sample_id:<20} | {exp_id:<12} | {frames_str:<30}"
+            logger.info(log_entry)
+        else:
+            logger.warning(f"  Could not find frame info for sample_id: {sample_id}")
+
+    if len(sorted_samples) > 15:
+        logger.info(f"  ... (and {len(sorted_samples) - 15} more samples)")
+    logger.info("-" * 70)
+
+
 def make_data_splits(
-    samples, params, results_dir, num_experiments, temporal_chunks=None
+    samples, datadict, params, results_dir, num_experiments, temporal_chunks=None
 ):
     """
     Make train/validation splits from list of samples, or load in a specific
@@ -531,7 +577,8 @@ def make_data_splits(
 
                 new_train_chunks = []
                 for chunk in train_chunks:
-                    if chunk[2] not in train_samples_to_be_removed:
+                    chunk_center = chunk[len(chunk) // 2]
+                    if chunk_center not in train_samples_to_be_removed:
                         new_train_chunks.append(chunk)
                 train_chunks = new_train_chunks
 
@@ -690,6 +737,16 @@ def make_data_splits(
     if params["data_split_seed"] is not None:
         np.random.seed()
 
+    # Debug print for the splits
+    print_split_debug_info("train", partition["train_sampleIDs"], datadict)
+    print_split_debug_info("validation", partition["valid_sampleIDs"], datadict)
+
+    # Save the partition to a file for later lookup
+    partition_path = os.path.join(results_dir, "partition.pkl")
+    with open(partition_path, "wb") as f:
+        pickle.dump(partition, f)
+    logger.info(f"💾 Saved data partition to {partition_path}")
+
     return partition
 
 
@@ -818,7 +875,7 @@ def add_unlabeled_to_train(
         selected_indices = np.random.choice(
             indices, size=sampling_num, replace=False
         )
-        selected_samples = sampleIDs[selected_indices]
+        selected_samples = sampleIDs[selected_indices.astype(int)]
     elif n_instances == 2:
         # if instance number equals 2 and we can find the other animal's com file,
         # read com file (`instancexcom3d.mat`) for the other animal

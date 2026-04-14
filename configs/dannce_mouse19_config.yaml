@@ -1,0 +1,68 @@
+### DANNCE mouse19 configuration ###
+
+### basic ###
+# File name of io.yaml file, which should exist in the directory from which you call dannce functions
+io_config: io.yaml
+random_seed: 1024
+
+### data ###
+dataset: label3d
+camnames: ['Camera1', 'Camera2', 'Camera3']
+n_views: 3
+num_validation_per_exp: 50
+data_split_seed: 1024
+
+# Update crop sizes to match your calibration/image dimensions
+crop_height: [0, 720]
+crop_width: [0, 1280]
+
+vmin: -120
+vmax: 120
+nvox: 80
+interp: nearest
+
+expval: True
+
+### data augmentations ###
+medfilt_window: 30
+rand_view_replace: True
+n_rand_views: 3
+mirror_augmentation: True
+left_keypoints: [1, 7, 8, 9, 13, 14, 15]
+right_keypoints: [2, 10, 11, 12, 16, 17, 18]
+augment_hue: False
+augment_brightness: False
+augment_bright_val: 0.01
+
+### model ###
+net_type: dannce
+n_channels_in: 3
+n_channels_out: 19
+new_n_channels_out: 19
+
+### train ###
+batch_size: 2
+epochs: 7
+save_period: 1
+
+train_mode: finetune
+dannce_finetune_weights: ./DANNCE/train00/checkpoint-epoch2.pth
+COM_augmentation: True
+COM_aug_iters: 2
+multi_gpu_train: False
+gpu_id: [0, 1, 2, 3]
+num_train_per_exp: 10000
+
+metric: ['euclidean_distance_3D']
+loss:
+  L1Loss:
+    loss_weight: 1.0
+
+lr: 0.0001
+
+### skeleton ###
+skeleton: mouse19
+body_profile: mouse19
+
+### prediction ###
+max_num_samples: max

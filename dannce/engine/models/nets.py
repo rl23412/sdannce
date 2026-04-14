@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,9 @@ from loguru import logger
 
 from dannce.engine.models.blocks import *
 from dannce.engine.models.posegcn.nets import PoseGCN
+from dannce.engine.skeletons.utils import load_body_profile
+from dannce.engine.models.visibility_head import VisibilityHead
+from dannce.engine.utils.checkpoint import torch_load_checkpoint
 from dannce.engine.utils.image import expected_value_3d, spatial_softmax
 
 _SDANNCE_ENCDEC = [
@@ -90,6 +93,17 @@ class EncDec3D(nn.Module):
                 ),
             )
 
+    @staticmethod
+    def _align_skip(x, skip):
+        """Crop to a shared spatial size before concatenating skip features."""
+        target_d = min(x.shape[-3], skip.shape[-3])
+        target_h = min(x.shape[-2], skip.shape[-2])
+        target_w = min(x.shape[-1], skip.shape[-1])
+        return (
+            x[..., :target_d, :target_h, :target_w],
+            skip[..., :target_d, :target_h, :target_w],
+        )
+
     def forward(self, x):
         skips, dec_feats = [], []
         # encoder
@@ -112,12 +126,15 @@ class EncDec3D(nn.Module):
 
         # decoder with skip connections
         x = self.decoder_upsample3(x)
+        x, skip_x3 = self._align_skip(x, skip_x3)
         x = self.decoder_res3(torch.cat([x, skip_x3], dim=1))
         dec_feats.append(x)
         x = self.decoder_upsample2(x)
+        x, skip_x2 = self._align_skip(x, skip_x2)
         x = self.decoder_res2(torch.cat([x, skip_x2], dim=1))
         dec_feats.append(x)
         x = self.decoder_upsample1(x)
+        x, skip_x1 = self._align_skip(x, skip_x1)
         x = self.decoder_res1(torch.cat([x, skip_x1], dim=1))
         dec_feats.append(x)
 
@@ -139,6 +156,9 @@ class DANNCE(nn.Module):
         return_features: bool = False,
         compressed: bool = False,
         return_enc_feats: bool = False,
+        visibility_num_views: int = 0,
+        visibility_hidden_dim: int = 128,
+        visibility_edges: Optional[List[Tuple[int, int]]] = None,
     ):
         super().__init__()
 
@@ -160,27 +180,66 @@ class DANNCE(nn.Module):
         self.n_joints = output_channels
 
         self.return_features = return_features
+        self.visibility_head = (
+            VisibilityHead(
+                output_channels,
+                visibility_num_views,
+                visibility_hidden_dim,
+                edges=visibility_edges,
+            )
+            if visibility_num_views > 0
+            else None
+        )
         self._initialize_weights()
 
-    def forward(self, volumes, grid_centers):
-        """
-        volumes: Tensor [batch_size, C, H, W, D]
-        grid_centers: [batch_size, nvox**3, 3]
-        """
-        volumes, inter_features = self.encoder_decoder(volumes)
-        heatmaps = self.output_layer(volumes)
-
+    def _forward_backbone(self, volumes, grid_centers):
+        feature_map, inter_features = self.encoder_decoder(volumes)
+        heatmaps = self.output_layer(feature_map)
         if grid_centers is not None:
             softmax_heatmaps = spatial_softmax(heatmaps)
             coords = expected_value_3d(softmax_heatmaps, grid_centers)
         else:
             coords = None
 
-        if self.return_features:
-            return coords, heatmaps, inter_features
-        for f in inter_features:
-            del f
-        return coords, heatmaps, None
+        return coords, heatmaps, inter_features, feature_map
+
+    def predict_visibility(self, coords, visibility_camera_features=None):
+        if self.visibility_head is None:
+            return None
+        return self.visibility_head(coords, visibility_camera_features)
+
+    def predict_with_aux(
+        self,
+        volumes,
+        grid_centers,
+        visibility_camera_features=None,
+    ):
+        """
+        volumes: Tensor [batch_size, C, H, W, D]
+        grid_centers: [batch_size, nvox**3, 3]
+        """
+        coords, heatmaps, inter_features, feature_map = (
+            self._forward_backbone(volumes, grid_centers)
+        )
+        visibility_logits = self.predict_visibility(coords, visibility_camera_features)
+
+        aux_outputs = {
+            "inter_features": inter_features if self.return_features else None,
+            "feature_map": feature_map if self.visibility_head is not None else None,
+            "visibility_logits": visibility_logits,
+            "visibility_camera_features": visibility_camera_features,
+        }
+
+        if not self.return_features:
+            for f in inter_features:
+                del f
+
+        return coords, heatmaps, aux_outputs
+
+    def forward(self, volumes, grid_centers):
+        coords, heatmaps, aux_outputs = self.predict_with_aux(volumes, grid_centers)
+
+        return coords, heatmaps, aux_outputs["inter_features"]
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -260,6 +319,13 @@ class COMNet(nn.Module):
             [(512, 256), (256, 128), (128, 64), (64, 32)],
         ]
 
+    @staticmethod
+    def _align_skip(x, skip):
+        """Crop to a shared spatial size before concatenating skip features."""
+        target_h = min(x.shape[-2], skip.shape[-2])
+        target_w = min(x.shape[-1], skip.shape[-1])
+        return x[..., :target_h, :target_w], skip[..., :target_h, :target_w]
+
     def forward(self, x):
         # encoder
         x = self.encoder_res1(x)
@@ -282,15 +348,19 @@ class COMNet(nn.Module):
 
         # decoder with skip connections
         x = self.decoder_upsample4(x)
+        x, skip_x4 = self._align_skip(x, skip_x4)
         x = self.decoder_res4(torch.cat([x, skip_x4], dim=1))
 
         x = self.decoder_upsample3(x)
+        x, skip_x3 = self._align_skip(x, skip_x3)
         x = self.decoder_res3(torch.cat([x, skip_x3], dim=1))
 
         x = self.decoder_upsample2(x)
+        x, skip_x2 = self._align_skip(x, skip_x2)
         x = self.decoder_res2(torch.cat([x, skip_x2], dim=1))
 
         x = self.decoder_upsample1(x)
+        x, skip_x1 = self._align_skip(x, skip_x1)
         x = self.decoder_res1(torch.cat([x, skip_x1], dim=1))
 
         x = self.output_layer(x)
@@ -317,6 +387,11 @@ def _initialize_dannce_backbone(
         "return_enc_feats": params["graph_cfg"].get("return_enc_feats", False)
         if "graph_cfg" in params and params["graph_cfg"] is not None
         else False,
+        "visibility_num_views": n_cams if params.get("learned_visibility_enabled", False) else 0,
+        "visibility_hidden_dim": params.get("learned_visibility_hidden_dim", 128),
+        "visibility_edges": load_body_profile(params.get("skeleton", "rat23"))["limbs"]
+        if params.get("learned_visibility_enabled", False)
+        else None,
     }
 
     # initialize the backbone
@@ -391,33 +466,86 @@ def load_pretrained_weights(
     model: nn.Module, checkpoint_path: str, skip_io_check: bool = False,
 ):
     """
-    Load pretrained weights into (s)DANNCE model.
+    Load pretrained weights into (s)DANNCE model with DataParallel compatibility.
     """
     assert checkpoint_path is not None and os.path.exists(
         checkpoint_path
     ), f"Checkpoint not found: {checkpoint_path}"
     logger.info(f"Loading pretrained weights from {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path)["state_dict"]
+    state_dict = torch_load_checkpoint(checkpoint_path)["state_dict"]
 
     if skip_io_check:
+        # Try direct loading first
+        try:
+            model.load_state_dict(state_dict, strict=False)
+            return model
+        except:
+            pass
+            
+        # If direct loading fails, try with module prefix handling
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(state_dict.keys())
+        
+        # Check if we need to add module. prefix
+        if any(key.startswith('module.') for key in model_keys) and not any(key.startswith('module.') for key in checkpoint_keys):
+            state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+        # Check if we need to remove module. prefix    
+        elif not any(key.startswith('module.') for key in model_keys) and any(key.startswith('module.') for key in checkpoint_keys):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
         model.load_state_dict(state_dict, strict=False)
         return model
 
-    # check whether input & output dimensions mismatch
+    # Original validation logic with prefix handling
+    try:
+        checkpoint_info = checkpoint_weights_type(state_dict)
+    except ValueError:
+        # Try with module prefix stripped
+        stripped_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}
+        if stripped_state_dict:
+            try:
+                checkpoint_info = checkpoint_weights_type(stripped_state_dict)
+                state_dict = stripped_state_dict
+            except ValueError:
+                pass
+        
+        # Try with module prefix added
+        if 'checkpoint_info' not in locals():
+            prefixed_state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+            try:
+                checkpoint_info = checkpoint_weights_type(prefixed_state_dict)
+                state_dict = prefixed_state_dict
+            except ValueError:
+                raise ValueError("Invalid checkpoint format after trying prefix adjustments.")
+
+    # Extract checkpoint information
     (
         is_sdannce_weights,
         checkpoint_input_size,
         checkpoint_output_size,
         input_weight_name,
         output_weight_name,
-    ) = checkpoint_weights_type(state_dict)
+    ) = checkpoint_info
+    
+    # Handle model state_dict with same prefix logic
+    try:
+        model_info = checkpoint_weights_type(model.state_dict())
+    except ValueError:
+        # Similar prefix handling for model state_dict
+        model_state_dict = model.state_dict()
+        if any(k.startswith('module.') for k in model_state_dict.keys()):
+            stripped_model_dict = {k.replace('module.', ''): v for k, v in model_state_dict.items()}
+            model_info = checkpoint_weights_type(stripped_model_dict)
+        else:
+            raise ValueError("Invalid model format.")
+    
     (
         is_sdannce_model,
         model_input_size,
         model_output_size,
         _,
         _,
-    ) = checkpoint_weights_type(model.state_dict())
+    ) = model_info
 
     # pop mismatch weights from checkpoint
     if checkpoint_input_size != model_input_size:
@@ -433,6 +561,17 @@ def load_pretrained_weights(
         )
         state_dict.pop(output_weight_name, None)
         state_dict.pop(output_weight_name.replace("weight", "bias"), None)
+
+    # Final prefix alignment before loading
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(state_dict.keys())
+    
+    # Check if we need to add module. prefix for final loading
+    if any(key.startswith('module.') for key in model_keys) and not any(key.startswith('module.') for key in checkpoint_keys):
+        state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+    # Check if we need to remove module. prefix for final loading   
+    elif not any(key.startswith('module.') for key in model_keys) and any(key.startswith('module.') for key in checkpoint_keys):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
     # load weights
     if is_sdannce_weights == is_sdannce_model:
@@ -489,10 +628,11 @@ def initialize_train(
         logger.info(
             "*** Resume training from {} ***".format(params["dannce_finetune_weights"])
         )
-        checkpoints = torch.load(params["dannce_finetune_weights"])
+        checkpoints = torch_load_checkpoint(params["dannce_finetune_weights"])
         optimizer = torch.optim.Adam(model_params)
         optimizer.load_state_dict(checkpoints["optimizer"])
-        params["start_epoch"] = checkpoints["epoch"]
+        # Checkpoints store the last completed epoch; resume at the next epoch.
+        params["start_epoch"] = int(checkpoints["epoch"]) + 1
 
     lr_scheduler = None
     if params["lr_scheduler"] is not None:
@@ -500,7 +640,7 @@ def initialize_train(
             torch.optim.lr_scheduler, params["lr_scheduler"]["type"]
         )
         lr_scheduler = lr_scheduler_class(
-            optimizer=optimizer, **params["lr_scheduler"]["args"], verbose=True
+            optimizer=optimizer, **params["lr_scheduler"]["args"]
         )
         logger.info(
             "Using learning rate scheduler: {}".format(params["lr_scheduler"]["type"])
@@ -534,7 +674,7 @@ def load_pretrained_com_weights(
         checkpoint_path
     ), f"Checkpoint not found: {checkpoint_path}"
     logger.info(f"Loading pretrained weights from {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path)["state_dict"]
+    state_dict = torch_load_checkpoint(checkpoint_path)["state_dict"]
 
     if skip_io_check:
         model.load_state_dict(state_dict, strict=False)
@@ -580,7 +720,7 @@ def initialize_com_train(
             torch.optim.lr_scheduler, params["lr_scheduler"]["type"]
         )
         lr_scheduler = lr_scheduler_class(
-            optimizer=optimizer, **params["lr_scheduler"]["args"], verbose=True
+            optimizer=optimizer, **params["lr_scheduler"]["args"]
         )
         logger.info(
             "Using learning rate scheduler: {}".format(params["lr_scheduler"]["type"])

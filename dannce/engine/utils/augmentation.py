@@ -33,7 +33,13 @@ def random_rotate(X, y_3d, aux=None):
 
 
 def apply_random_transforms(volumes, grids, aux=None):
-    grids = grids.reshape(grids.shape[0], 80, 80, 80, 3)
+    nvox = int(round(grids.shape[1] ** (1 / 3)))
+    if nvox ** 3 != grids.shape[1]:
+        raise ValueError(
+            f"Expected a cubic voxel grid, got {grids.shape[1]} grid centers."
+        )
+
+    grids = grids.reshape(grids.shape[0], nvox, nvox, nvox, 3)
 
     volumes, grids, aux = random_rotate(volumes, grids, aux)
     grids = grids.reshape(grids.shape[0], -1, 3)
@@ -41,6 +47,9 @@ def apply_random_transforms(volumes, grids, aux=None):
 
 
 def construct_augmented_batch(volumes, grids, aux=None, copies_per_sample=1):
+    if copies_per_sample < 1:
+        raise ValueError("copies_per_sample must be at least 1")
+
     copies = []
     n_samples = volumes.shape[0]
     for i in range(n_samples):

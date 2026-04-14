@@ -102,18 +102,41 @@ class PoseGCN(nn.Module):
         self.use_residual = model_params.get("use_residual", True)
 
     def forward(self, volumes, grid_centers):
-        # initial pose generation from encoder-decoder
-        init_poses, heatmaps, inter_features = self.pose_generator(
+        init_poses, final_poses, heatmaps, _ = self.predict_with_aux(
             volumes, grid_centers
         )
 
+        return init_poses, final_poses, heatmaps
+
+    def predict_with_aux(
+        self,
+        volumes,
+        grid_centers,
+        visibility_camera_features=None,
+    ):
+        # initial pose generation from encoder-decoder
+        init_poses, heatmaps, aux_outputs = self.pose_generator.predict_with_aux(
+            volumes,
+            grid_centers,
+            visibility_camera_features=visibility_camera_features,
+        )
+        inter_features = aux_outputs.get("inter_features")
+
         # refine pose estimations using GCN
         final_poses = self.inference(init_poses, grid_centers, heatmaps, inter_features)
-
         if self.use_residual:
             final_poses += init_poses
 
-        return init_poses, final_poses, heatmaps
+        visibility_logits = None
+        if visibility_camera_features is not None:
+            visibility_logits = self.pose_generator.predict_visibility(
+                final_poses,
+                visibility_camera_features,
+            )
+
+        aux_outputs["visibility_logits"] = visibility_logits
+        aux_outputs["visibility_camera_features"] = visibility_camera_features
+        return init_poses, final_poses, heatmaps, aux_outputs
 
     def inference(self, init_poses, grid_centers, heatmaps=None, inter_features=None):
         coord_grids = (
@@ -176,4 +199,3 @@ class PoseGCN(nn.Module):
 
         final_poses = x
         return final_poses
-
